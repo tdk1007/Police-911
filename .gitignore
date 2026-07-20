@@ -2,3 +2,8 @@
 *.zip
 *.rar
 *.webloc
+
+# Generated Xcode project scaffold — this is its own git repo, versioned
+# separately at github.com/tdk1007/policegun-ios. Regenerate locally per
+# PoliceGun/SPIKE.md (drop ios/PoliceGunApp.swift into a fresh Xcode project).
+PoliceGun/ios/PoliceGun/

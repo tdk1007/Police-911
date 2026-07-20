@@ -22,6 +22,12 @@ into PCSX2's EyeToy device — it is **not** part of this phone gun.
 | iPhone app (gyro → UDP) | `ios/PoliceGunApp.swift` | iPhone 17 Pro |
 | Input helper (UDP → SendInput) | `windows/gun_helper.py` | Windows 11 PC |
 
+`ios/PoliceGunApp.swift` is the source of truth — drop it into a fresh
+Xcode project per `SPIKE.md`. The full buildable Xcode project scaffold
+(xcodeproj, tests, assets) is versioned separately at
+[github.com/tdk1007/policegun-ios](https://github.com/tdk1007/policegun-ios)
+as a convenience backup; it's not embedded in this repo.
+
 ```
 iPhone gyro ──UDP/WiFi/100Hz──▶ gun_helper.py ──SendInput(relative)──▶ PCSX2 ──▶ Police 911
 ```
