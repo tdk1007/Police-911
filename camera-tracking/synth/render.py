@@ -1,7 +1,7 @@
 """Frame synthesis for the Police 24/7 synthetic camera.
 
 Everything the game sees is generated here. Two hard constraints, both verified
-against the game's own code (see re/RE_FINDINGS.md):
+against the game's own code (see ../re/RE_FINDINGS.md):
 
   * The game is LUMINANCE-ONLY. Its frame converter reads one byte per pixel and
     writes it to R, G and B. Colour is discarded, so we only ever draw in gray.

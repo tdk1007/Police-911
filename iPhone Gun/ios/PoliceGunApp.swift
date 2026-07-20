@@ -19,6 +19,7 @@
 //   4. Run on the physical iPhone (gyro/accelerometer aren't in the simulator).
 
 import SwiftUI
+import Combine
 import CoreMotion
 import Network
 import AVFoundation
@@ -85,10 +86,10 @@ final class GunController: ObservableObject {
     @AppStorage("port") var port: Int = 52777
 
     // Feel
-    @AppStorage("sensitivity") var sensitivity: Double = 900   // counts per rad
+    @AppStorage("sensitivity") var sensitivity: Double = 3200  // counts per rad
     @AppStorage("invertX") var invertX: Bool = false
     @AppStorage("invertY") var invertY: Bool = true
-    @AppStorage("swapAxes") var swapAxes: Bool = false
+    @AppStorage("yScale") var yScale: Double = 1.0             // vertical multiplier
     @AppStorage("deadzone") var deadzone: Double = 0.01        // rad/s
 
     // Triggers
@@ -106,6 +107,8 @@ final class GunController: ObservableObject {
     private var smoothX = 0.0
     private var smoothY = 0.0
     private let smoothing = 0.35
+    private var lastElev = 0.0
+    private var hasElev = false
     private var lastTapTime: CFTimeInterval = 0
     private var motionMuteUntil: CFTimeInterval = 0
     private var pulseToken = 0
@@ -117,6 +120,7 @@ final class GunController: ObservableObject {
 
     func start() {
         client.connect(host: host, port: UInt16(port))
+        hasElev = false
         startVolumeTrigger()
         guard motion.isDeviceMotionAvailable else { return }
         motion.deviceMotionUpdateInterval = 1.0 / 100.0
@@ -189,18 +193,28 @@ final class GunController: ObservableObject {
             }
         }
 
-        // --- aim: angular velocity → relative deltas ---
-        var yaw = dm.rotationRate.y
-        var pitch = dm.rotationRate.x
-        if swapAxes { swap(&yaw, &pitch) }
-        yaw = abs(yaw) < deadzone ? 0 : yaw
-        pitch = abs(pitch) < deadzone ? 0 : pitch
-        smoothX = smoothX * smoothing + yaw * (1 - smoothing)
-        smoothY = smoothY * smoothing + pitch * (1 - smoothing)
-
+        // --- aim: barrel heading/elevation, orientation-agnostic ---
+        // Yaw = angular velocity about the WORLD vertical (up = -gravity), so
+        // left/right aim works no matter how the phone is held (flat, on-edge
+        // in the grip, or anywhere between). Pitch = change in the barrel's
+        // absolute elevation angle (barrel = device +Y, camera end forward),
+        // measured from gravity — so vertical aim can't drift.
+        let g = dm.gravity                       // unit vector, device frame, points down
+        let rr = dm.rotationRate
+        var yawRate = -(rr.x * g.x + rr.y * g.y + rr.z * g.z)
+        let elev = asin(max(-1.0, min(1.0, -g.y)))
         let dt = motion.deviceMotionUpdateInterval
-        var dx = smoothX * sensitivity * dt
-        var dy = smoothY * sensitivity * dt
+        var pitchRate = hasElev ? (elev - lastElev) / dt : 0
+        lastElev = elev
+        hasElev = true
+
+        yawRate = abs(yawRate) < deadzone ? 0 : yawRate
+        pitchRate = abs(pitchRate) < deadzone ? 0 : pitchRate
+        smoothX = smoothX * smoothing + yawRate * (1 - smoothing)
+        smoothY = smoothY * smoothing + pitchRate * (1 - smoothing)
+
+        var dx = -smoothX * sensitivity * dt
+        var dy = smoothY * sensitivity * yScale * dt
         if invertX { dx = -dx }
         if invertY { dy = -dy }
         if now < motionMuteUntil { dx = 0; dy = 0 }   // mute aim during a tap
@@ -244,11 +258,14 @@ struct ContentView: View {
                 Section("Feel") {
                     VStack(alignment: .leading) {
                         Text("Sensitivity \(Int(gun.sensitivity))")
-                        Slider(value: $gun.sensitivity, in: 200...2500)
+                        Slider(value: $gun.sensitivity, in: 500...8000)
+                    }
+                    VStack(alignment: .leading) {
+                        Text(String(format: "Y scale ×%.2f", gun.yScale))
+                        Slider(value: $gun.yScale, in: 0.5...2.0)
                     }
                     Toggle("Invert X", isOn: $gun.invertX)
                     Toggle("Invert Y", isOn: $gun.invertY)
-                    Toggle("Swap axes", isOn: $gun.swapAxes)
                 }
 
                 Section("Trigger (pick any — all free)") {

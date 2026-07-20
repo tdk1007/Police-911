@@ -1,4 +1,4 @@
-# PoliceGun
+# iPhone Gun
 
 An iPhone-as-light-gun for **Police 911 / Police 24/7 (PS2)** running under
 **PCSX2 on Windows 11**.
@@ -12,15 +12,25 @@ fire (confirmed working by hand). So v1.0 turns the iPhone's **gyro** into that
 relative mouse: angular velocity → mouse deltas. No LiDAR, no AR, no
 calibration — those only pay off for GunCon2 games and are deferred to v2.0.
 
-The body-dodge (duck/lean) mechanic is handled separately by a fixed webcam fed
-into PCSX2's EyeToy device — it is **not** part of this phone gun.
+The body-dodge (duck/lean) mechanic is handled separately by the
+[`camera-tracking/`](../camera-tracking/) effort fed into PCSX2's EyeToy
+device — it is **not** part of this phone gun.
 
 ## Pieces
 
 | Part | Path | Runs on |
 |------|------|---------|
 | iPhone app (gyro → UDP) | `ios/PoliceGunApp.swift` | iPhone 17 Pro |
+| Xcode project scaffold | `ios/PoliceGun/PoliceGun.xcodeproj` | Mac (build target) |
 | Input helper (UDP → SendInput) | `windows/gun_helper.py` | Windows 11 PC |
+
+`ios/PoliceGunApp.swift` is the **source of truth** — a single file defining
+both the `@main` app entry and the SwiftUI UI (aim mapping is v1.1
+orientation-agnostic; see `SPIKE.md`). The `ios/PoliceGun/` Xcode project is a
+convenience scaffold to build it in: open it and replace the template app file's
+contents with `ios/PoliceGunApp.swift` per `SPIKE.md` (delete the template's
+duplicate `@main` / stub `ContentView`). The scaffold's own `xcuserstate` is
+gitignored.
 
 ```
 iPhone gyro ──UDP/WiFi/100Hz──▶ gun_helper.py ──SendInput(relative)──▶ PCSX2 ──▶ Police 911
@@ -34,7 +44,8 @@ iPhone gyro ──UDP/WiFi/100Hz──▶ gun_helper.py ──SendInput(relative
    ```
    It listens on `0.0.0.0:52777` and prints packet stats.
 2. **Find the PC's IP:** `ipconfig` → IPv4 address (e.g. `192.168.0.50`).
-3. **iPhone:** build `PoliceGunApp.swift` in Xcode onto the physical phone
+3. **iPhone:** open `ios/PoliceGun/PoliceGun.xcodeproj`, drop in
+   `ios/PoliceGunApp.swift` (see `SPIKE.md`), and build onto the physical phone
    (gyro isn't in the simulator). Enter the PC IP, tap **Start**.
 4. Wave the phone → the **Windows mouse cursor** should move. Hold **FIRE** →
    left-click. That's the whole pipeline validated.
@@ -45,9 +56,12 @@ that the PC isn't stranded on a different VLAN.
 
 ## Spike 2 — tune against the game
 
-Launch PCSX2 with Police 911, USB port = **HID Mouse**, fullscreen. Aim the
-phone and adjust in-app: **Sensitivity**, **Invert X/Y**, **Swap axes** until
-the crosshair tracks your muzzle. Expect "playable-but-drifty, bump-the-edge to
+Launch PCSX2 with Police 911, USB port = **HID Mouse**, fullscreen. Disable
+Windows "Enhance pointer precision" first (it wrecks aim linearity). Aim the
+phone and adjust in-app: **Sensitivity**, **Y scale**, **Invert X/Y** until the
+crosshair tracks your muzzle. Aim mapping is orientation-agnostic since v1.1
+(yaw about world vertical, pitch from barrel elevation — hold it any way, and
+vertical aim can't drift). Expect "playable-but-drifty, bump-the-edge to
 recenter" — same as any mouse playthrough of this title.
 
 ## Roadmap
@@ -69,3 +83,5 @@ UDP datagram, JSON, ~100 Hz:
 `dx`/`dy` = relative mouse counts since the last packet (fractional; the helper
 carries the remainder). `fire` = current trigger state; helper emits button
 down/up on transitions.
+</content>
+</invoke>

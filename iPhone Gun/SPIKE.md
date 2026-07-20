@@ -10,7 +10,7 @@ Stage 2: (no PC)     phone ──▶ Mac monitor prints packets                 
 Stage 3: (full)      phone ──▶ Windows helper ──▶ cursor moves & clicks     [proves the chain]
 ```
 
-Files live in `PoliceGun/`:
+Files live in `iPhone Gun/`:
 - `windows/gun_helper.py` — the real injector (Windows only)
 - `tools/udp_monitor.py` — prints incoming packets, no injection (Mac or Windows)
 - `tools/send_test.py` — fake phone: streams a circle + clicks (Mac or Windows)
@@ -70,10 +70,14 @@ proven. Ctrl-C both.
 
 ## Stage 2 — prove the phone transmits (no PC needed)
 
-1. **Build the app:** open Xcode → **File ▸ New ▸ Project ▸ iOS ▸ App**. Name it
-   `PoliceGun`, Interface **SwiftUI**, Language **Swift**. In the Project Navigator,
-   open the generated `PoliceGunApp.swift` and **replace its entire contents** with
-   `ios/PoliceGunApp.swift` from this folder.
+1. **Build the app:** a ready Xcode project scaffold ships in this folder at
+   `ios/PoliceGun/PoliceGun.xcodeproj` — open it in Xcode. In the Project
+   Navigator, open the template `PoliceGun/PoliceGunApp.swift`, delete the stub
+   `ContentView.swift`, and **replace the app file's entire contents** with
+   `ios/PoliceGunApp.swift` from this folder (the source of truth — it defines
+   both `@main` and the UI in one file, so remove the template's duplicate
+   `@main`). Prefer starting fresh? File ▸ New ▸ Project ▸ iOS ▸ App named
+   `PoliceGun` (SwiftUI/Swift) and drop the same file in.
 2. Select **Signing & Capabilities ▸ Team** → your personal Apple ID. Set the
    deployment target to iOS 16+.
 3. Plug in the iPhone, select it as the run destination, press **▶ Run**. First
@@ -116,12 +120,23 @@ That's Spike 1 complete: the iPhone is a working wireless mouse you aim with.
 
 ## Stage 4 — into the game (Spike 2, tuning)
 
+First, on Windows: **Settings ▸ Bluetooth & devices ▸ Mouse ▸ Additional mouse
+settings ▸ Pointer Options → uncheck "Enhance pointer precision"** — Windows
+applies pointer acceleration to injected motion and it wrecks aim linearity.
+
 Launch PCSX2 with Police 911, set the USB port to **HID Mouse**, go fullscreen.
 Aim the phone and tune in the app until the crosshair follows your muzzle:
 
-- **Sensitivity** — counts per radian. Start ~900; raise for faster aim.
+- **Sensitivity** — counts per radian. Start ~3200; raise if you can't sweep
+  edge-to-edge, lower if aim is twitchy.
+- **Y scale** — vertical multiplier on top of Sensitivity, for games that
+  scale X and Y differently.
 - **Invert X / Invert Y** — flip if the crosshair goes the wrong way.
-- **Swap axes** — if aiming up moves it sideways, toggle this first.
+
+Aim mapping is orientation-agnostic (since v1.1): yaw is measured about the
+world vertical and pitch from the barrel's absolute elevation (barrel = the
+phone's long axis, camera end forward). Hold it flat, on-edge, or in the grip —
+same behavior, and vertical aim cannot drift.
 
 Expect "playable-but-drifty, bump a screen edge to recenter" — normal for any
 relative-mouse playthrough of this title. That feel is the target for v1.0.
@@ -135,7 +150,9 @@ relative-mouse playthrough of this title. That feel is the target for v1.0.
 | Stage 1 cursor doesn't move | Helper not running as the same user as the foreground app; or firewall blocked it. Re-run, click **Allow**. |
 | Stage 2 monitor shows nothing | Phone on a different VLAN/WiFi than the Mac; wrong IP typed; app not **Start**ed. |
 | Packets arrive but no cursor motion (Stage 3) | You're pointing the phone at the **monitor** IP, not the **helper** (Windows) IP. |
-| Cursor moves but backwards / sideways | Invert X/Y and Swap axes in the app. Grip-dependent, one-time. |
+| Cursor moves but backwards / sideways | Invert X/Y in the app. One-time. |
+| Up/down aim weak or dead | Fixed in v1.1 (orientation-agnostic mapping). If still weak in-game, raise **Y scale**. |
+| Aim feels nonlinear / laggy on desktop | Disable Windows "Enhance pointer precision" (see Stage 4). |
 | Cursor jitters at rest | Raise **deadzone** slightly (in code, `deadzone` default 0.01 rad/s). |
 | Crosshair "sticks" then jumps | Normal relative-mouse drift; bump a screen edge to resync, or lower sensitivity. |
 | No Firewall prompt appeared | `netsh` rule above; also ensure network profile is **Private**, not Public. |

@@ -46,7 +46,7 @@ $BiosDir = Join-Path $Root 'PCSX2\bios'
 # PCSX2 cannot parse .cue files — boot the raw MODE2/2352 .bin directly
 # (single data track; the XA audio is interleaved in it, nothing is lost)
 $Game   = Join-Path $Root 'Police 24-7 (Europe) (En,Fr,De,Es,It)\Police 24-7 (Europe) (En,Fr,De,Es,It).bin'
-$Bridge = Join-Path $Root 'bridge\police247_bridge.py'
+$Bridge = Join-Path $Root 'camera-tracking\bridge\police247_bridge.py'
 $GunHelper = Join-Path $Root 'iPhone Gun\windows\gun_helper.py'
 $PhonePref = Join-Path $Root '.launcher-phone.pref'   # remembers the checkbox state
 
