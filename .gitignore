@@ -1,0 +1,14 @@
+# --- Large / copyrighted content (do not commit) ---
+PCSX2/
+Police 24-7 (Europe) (En,Fr,De,Es,It)/
+Police 24-7 (Europe) (En,Fr,De,Es,It).zip
+extracted/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db

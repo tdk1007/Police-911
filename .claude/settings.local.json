@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:wiki.pcsx2.net)",
+      "WebFetch(domain:forum.arcadecontrols.com)",
+      "WebFetch(domain:www.arcade-museum.com)",
+      "WebFetch(domain:hokutonoshock.blogspot.com)",
+      "WebFetch(domain:forums.atariage.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:assemblergames.org)",
+      "Bash(gh api *)",
+      "WebFetch(domain:psxdatacenter.com)",
+      "WebFetch(domain:onlinemanual.insta360.com)",
+      "WebFetch(domain:openfirelightgun.org)",
+      "WebFetch(domain:retroachievements.org)",
+      "WebFetch(domain:ja.wikipedia.org)",
+      "WebFetch(domain:web.archive.org)",
+      "WebFetch(domain:www.youtube.com)",
+      "PowerShell(Get-PnpDevice *)",
+      "Bash(gh auth *)",
+      "Bash(gh repo *)",
+      "PowerShell($g = Get-Command gh -ErrorAction SilentlyContinue; if \\($g\\) { \"gh: $\\($g.Source\\)\"; gh auth status } else { \"gh not found\" }; \"---GIT---\"; $git = Get-Command git -ErrorAction SilentlyContinue; if \\($git\\) { \"git: $\\($git.Source\\)\" } else { \"git not found\" })"
+    ]
+  }
+}
