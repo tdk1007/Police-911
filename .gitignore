@@ -3,11 +3,18 @@ PCSX2/
 Police 24-7 (Europe) (En,Fr,De,Es,It)/
 Police 24-7 (Europe) (En,Fr,De,Es,It).zip
 extracted/
+*.zip
+*.rar
+*.webloc
 
 # --- Python ---
 __pycache__/
 *.pyc
 *.pyo
+
+# --- Generated Xcode project scaffold (MacBook effort) ---
+# Versioned separately at github.com/tdk1007/policegun-ios per PoliceGun/SPIKE.md.
+PoliceGun/ios/PoliceGun/
 
 # --- OS / editor cruft ---
 .DS_Store
