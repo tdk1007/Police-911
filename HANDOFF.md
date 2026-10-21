@@ -24,10 +24,23 @@ test order are in **`vr/IMMERSIVE.md`**. **ACTION NEEDED (user, in the headset):
 - The fork's `PCSX2.ini` was edited for the tests (90 Hz, EE 300%, D3D11, 4×, [VR]). The launcher re-asserts these settings on each launch. The
   pre-test copy is `PCSX2.ini.pre-vr90`.
 - New helpers: `pshot.py` (frame grab via savestate, no focus needed) and `gsvram.py` (GS VRAM framebuffer decode from a .p2s).
-- Open: no menu/theater fallback in immersive mode, and no positional parallax (head translation drives lean/duck). See IMMERSIVE.md.
+- Open: no positional parallax (head translation drives lean/duck). See IMMERSIVE.md.
+- **Flat-screen fallback BUILT (2026-10-21, later session), desktop-verified:** outside a stage the fork shows the normal
+  picture on a world-locked SteamVR overlay over black eyes (`VRSession::PresentFlat`/`WorldActive`).
+  - The trigger is a new vrcam counter `play` (slot `+0x4C`, cave `0x4F0300`) on the fire handler's six call sites. It runs
+    once per gameplay tick. vrcam's `applied` was no good: Sensor Adjustment and other menus render through the same view.
+    RE notes are in RE_FINDINGS.md, "Scene state machine".
+  - Verified in dryrun: Sensor Adjustment stays flat, the lobby goes stereo (log `VR: gameplay, stereo`), and a stalled
+    counter goes flat after 15 vsyncs and comes back. The overlay itself is compiled but untested (headset test 6 in
+    IMMERSIVE.md).
+  - `[VR] Menus = world | head | stereo` picks the presentation. ROADMAP's menu item is still the user's choice (head-locked
+    panel, virtual room, or world-locked screen, which is the "floating display" the design avoids). The flat screen is a
+    stopgap so the menus are usable in the first headset test, not a decision.
+  - Eye PNG dumps are now behind `[VR] DumpEyes` (off). The stray `pcsx2-vr/deps/deps` was deleted (1.3 GB; the build
+    never used it, verified by rebuilding without it).
 
 ### ▶ NEXT TASKS (in order)
-1. **Headset test (needs the user):** run `vr/IMMERSIVE.md` steps 1–5.
+1. **Headset test (needs the user):** run `vr/IMMERSIVE.md` steps 1–6 (6 = the new flat screen).
    - Fix whatever breaks in `pcsx2/GS/VR/VRSession.cpp`: the D3D11 submit, the texture bounds, the pose delay.
    - Tune `TanH/TanV`, `PoseDelay`, `SwapEyes` and `UnitsPerMetre`.
    - After any fork edit, re-export the patch:
@@ -35,14 +48,18 @@ test order are in **`vr/IMMERSIVE.md`**. **ACTION NEEDED (user, in the headset):
 2. **Aim check in VR:** in training (savestate 8: infinite time and ammo), turn your head ±30° and shoot.
    - The `vrshot.py --status` count `used` must rise with each shot.
    - If the ring and the hits disagree, check `AIM_DIST_M` (6 m) and the logic-frame math in `frame_bridge.aim_target`.
-3. **Menu/theater fallback:** while vrcam's `applied` counter (`0x4F8038`) stops advancing (title, menus, captions), present a
-   world-locked flat quad instead of full-FOV eyes (IVROverlay, or a quad in the submitted eye textures).
+3. ~~**Menu/theater fallback**~~ BUILT, see above. Still to check in the headset: the overlay renders and is opaque, and
+   mid-stage pauses and cutscenes behave sensibly.
 4. **Positional comfort:** decide whether small head translation (beyond what lean/duck uses) should also go into the view
    (eye-space translate in the vrcam S_TX slots, with y and z added to vr90's per-eye x).
 5. **Busier scenes:** confirm 180 renders/s holds in heavy firefights and in interval-1 (50 Hz sim) scenes. If not, the fallback
    is stereo at the achieved rate plus SteamVR reprojection, which already works through `Submit_TextureWithPose`.
-6. Tidy-up: delete the stray `pcsx2-vr/deps/deps`. Debug leftovers: `vr_eye{0,1}.png` dumps every 5 s in `GSRenderer::VRCompose`
-   (remove them, or put them behind a setting).
+6. **Gun model on the controller** (user, 2026-10-21): a free pistol asset that tracks the right controller, drawn by the fork
+   into both eyes. It ships together with the muzzle flash, a haptic pulse on fire, a laser or tritium sights, and the game's
+   green ring hidden. The plan and licensing notes are in ROADMAP.md, "VR immersion".
+   - Design intent: immersed in the world, not a floating display. So also do the HUD placement and the menu handling from the
+     same ROADMAP section.
+7. ~~Tidy-up~~ DONE (deps/deps deleted, eye dumps behind `DumpEyes`).
 
 ## ▶ OPEN BUG (2026-10-20, end of session): VR launch lands on the DESKTOP, not Theater
 The launch chain works end to end. Clicking "Police 24-7 (VR)" in Steam with SteamVR down:

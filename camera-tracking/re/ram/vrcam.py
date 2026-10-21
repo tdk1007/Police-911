@@ -21,6 +21,13 @@ Three more spots load constants from SLOTS instead of building them inline:
 so FOV and culling can be changed live. A smaller scale = wider FOV
 (tan(half-FOV) grows by 1/scale). A smaller k = wider culling planes.
 
+Gameplay counter: menus, the title and Sensor Adjustment also render through
+0x1B9180, so S_APPLIED keeps counting there. The fire handler 0x185040 runs once
+per sim tick of actual play only (called from each game mode's tick, e.g.
+0x1DD4A0, next to the shot collision and the stage timers). Its six call sites
+go through a cave that bumps S_PLAY, which the VR fork uses to pick stereo
+(advancing) or the flat screen (stalled).
+
 Memory: the ELF's crt0 zero-fills BSS up to 0x500000 and calls SetupHeap(0x500000),
 and no code addresses 0x4A8000-0x4FFFFF (lui scan 2026-10-20), so the cave and the
 slots live there. All four savestates read zero there too.
@@ -64,6 +71,12 @@ S_YAW = 0x34
 S_APPLIED = 0x38     # u32, cave bumps this once per rendered view
 S_POSE_SEQ = 0x40    # u32, writer bumps this with every pose
 S_POSE_USED = 0x44   # u32, cave copies POSE_SEQ here when it applies a pose
+S_RECENTER = 0x48    # u32, the bridge sets it, the VR fork clears it (re-zero head yaw)
+S_PLAY = 0x4C        # u32, play cave bumps this once per gameplay sim tick
+
+FIRE_HANDLER = 0x00185040
+PLAY_CAVE = CAVE + 0x300
+PLAY_SITES = (0x0018141C, 0x001DD4D8, 0x001E3230, 0x001EBED8, 0x001EE058, 0x001F7B04)
 
 STOCK = {
     S_HSCALE: 0x3FD3333340000000,       # 0.30000001192
@@ -77,6 +90,10 @@ NOP = 0x00000000
 
 def _jal(target):
     return 0x0C000000 | ((target >> 2) & 0x03FFFFFF)
+
+
+def _j(target):
+    return 0x08000000 | ((target >> 2) & 0x03FFFFFF)
 
 
 def _lui(rt, imm):
@@ -140,6 +157,13 @@ CAVE_CODE = (
 )
 
 
+# Bump S_PLAY, then tail-jump to the fire handler (ra still points at the caller).
+# t0/t1 are free at a call site; a0-a3 pass through.
+PLAY_CODE = [_lui(T0, 0x50),
+             _lw(T1, T0, _slot_off(S_PLAY)), _addiu(T1, T1, 1), _sw(T1, T0, _slot_off(S_PLAY)),
+             _j(FIRE_HANDLER), NOP]
+
+
 def _ld_slot(o, nops):
     return [_lui(A0, 0x50), _ld(A0, A0, _slot_off(o))] + [NOP] * nops
 
@@ -152,7 +176,7 @@ PATCHES = [
     (0x001496C0, [0x3C043FD8, 0x0004203C], _ld_slot(S_CULL_H, 0)),
     (0x001498B4, [0x3C043FD1, 0x3484EB85, 0x00042438, 0x34841EB8, 0x00042438, 0x348451EC],
      _ld_slot(S_CULL_V, 4)),
-]
+] + [(a, [_jal(FIRE_HANDLER)], [_jal(PLAY_CAVE)]) for a in PLAY_SITES]
 
 
 def _f2d(x):
@@ -188,11 +212,12 @@ def enable(p):
     # slots first: the patched glFrustum would read a 0.0 scale otherwise
     for o, q in STOCK.items():
         p.write64(SLOTS + o, q)
-    p.write_many([(SLOTS + o, 0) for o in range(S_TX, S_POSE_USED + 4, 4)])
-    for i, w in enumerate(CAVE_CODE):
-        p.write32(CAVE + 4 * i, w)
-    if _words(p, CAVE, len(CAVE_CODE)) != CAVE_CODE:
-        raise RuntimeError('cave readback mismatch')
+    p.write_many([(SLOTS + o, 0) for o in range(S_TX, S_PLAY + 4, 4)])
+    for base, code in ((CAVE, CAVE_CODE), (PLAY_CAVE, PLAY_CODE)):
+        for i, w in enumerate(code):
+            p.write32(base + 4 * i, w)
+        if _words(p, base, len(code)) != code:
+            raise RuntimeError('cave readback mismatch')
     # call site last, once everything it reaches exists
     for addr, orig, new in reversed(PATCHES):
         for i, w in enumerate(new):
@@ -244,6 +269,7 @@ def read_status(p):
         'eye': tuple(-f(S_TX + 4 * i) for i in range(3)),
         'applied': p.read32(SLOTS + S_APPLIED),
         'pose_used': p.read32(SLOTS + S_POSE_USED),
+        'play': p.read32(SLOTS + S_PLAY),
         'game_fov_deg': struct.unpack('<f', struct.pack('<I', p.read32(0x002C6128)))[0],
     }
 
@@ -283,9 +309,14 @@ def selftest():
         good = any(word(a + 4 * i) >> 16 == 0x27BD and word(a + 4 * i) & 0x8000 for i in range(2))
         ok &= good
         print(f"{'ok ' if good else 'BAD'} {name} @ {a:08x} opens a stack frame")
-    good = CAVE + 4 * len(CAVE_CODE) < SLOTS and all(SLOTS + o < 0x500000 for o in range(0, 0x48, 4))
+    good = (CAVE + 4 * len(CAVE_CODE) <= PLAY_CAVE and PLAY_CAVE + 4 * len(PLAY_CODE) <= CAVE + 0x400
+            and all(SLOTS + o < 0x500000 for o in range(0, S_PLAY + 4, 4)) and S_PLAY + 4 <= 0x80)
     ok &= good
-    print(f"{'ok ' if good else 'BAD'} cave {len(CAVE_CODE)} words @ {CAVE:08x}, slots @ {SLOTS:08x}")
+    print(f"{'ok ' if good else 'BAD'} cave {len(CAVE_CODE)} words @ {CAVE:08x}, play cave {len(PLAY_CODE)} @ "
+          f"{PLAY_CAVE:08x} (below vr90 @ +0x400), slots @ {SLOTS:08x} (below vr90 @ +0x80)")
+    good = word(FIRE_HANDLER) >> 16 == 0x27BD and bool(word(FIRE_HANDLER) & 0x8000)
+    ok &= good
+    print(f"{'ok ' if good else 'BAD'} fire handler @ {FIRE_HANDLER:08x} opens a stack frame")
     good = _slot_off(0) == 0x8000 and _ld(A0, A0, _slot_off(0)) == 0xDC848000
     ok &= good
     print(f"{'ok ' if good else 'BAD'} ld a0,-0x8000(a0) = {_ld(A0, A0, _slot_off(0)):08x}")
@@ -306,6 +337,7 @@ def pnach_lines():
         out += [f'patch=1,EE,{SLOTS + o:08X},word,{q & 0xFFFFFFFF:08X}',
                 f'patch=1,EE,{SLOTS + o + 4:08X},word,{q >> 32:08X}']
     out += [f'patch=1,EE,{CAVE + 4 * i:08X},word,{w:08X}' for i, w in enumerate(CAVE_CODE)]
+    out += [f'patch=1,EE,{PLAY_CAVE + 4 * i:08X},word,{w:08X}' for i, w in enumerate(PLAY_CODE)]
     for addr, _, new in reversed(PATCHES):
         out += [f'patch=1,EE,{addr + 4 * i:08X},word,{w:08X}' for i, w in enumerate(new)]
     return out

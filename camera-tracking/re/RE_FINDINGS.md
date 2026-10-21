@@ -393,3 +393,19 @@ Live, in the pcsx2-vr fork (v2.6.3) over PINE, savestates 9 (hotel lobby) and 8 
 - Collision is `0x190060` → `0x18F250`, against the list `0x3B56EC`: a sphere test, then a mesh test (`0x18E840`).
 - **The hit test ignores the render view, the head rotation and the FOV.**
 - `vrshot.py` retargets the two call sites to a cave that substitutes the bridge's logic-frame shot coordinates.
+
+## Scene state machine and a gameplay signal (2026-10-21, Ghidra + live)
+- The main loop's `sceneStep(0x2C6080)` (`0x1335D0`) runs a state machine `{handler table, callback, state}`: each handler
+  returns `{2, next}` to switch. The top object at `0x2C6080` sits in state 3 (`0x133150`) from boot onwards, which runs a
+  nested machine at `0x434648` (table `0x259390`, 15 handlers, state at `0x434650`).
+- `0x434650` values seen: 0→1→2→3 during boot, 3 = Sensor Adjustment, 5 = mode select (`0x1CB380`; it routes to
+  6, 8, 9, 0xB, 0xD, 0xE), 6 = story mode (slots 7 and 9), 10 = training (slot 8). Each mode handler runs its own nested
+  machine at `0x434590 + 12*state` and writes a mode id into a gp global (`gp-0x6F00`: 1 story, 2 training, 5 select).
+  So the mode states hold briefings, results and the stage alike: no clean "in a stage" value at this level.
+- **vrcam's `applied` counter (per render view) also runs in menus**: Sensor Adjustment renders through `0x1B9180`.
+- **Gameplay signal:** the fire handler `0x185040` is called from each mode's per-tick update (e.g. `0x1DD4A0`, together
+  with the shot collision `0x190060` and the stage timers `0x3A6A68`/`0x3A69F8`). The six call sites are `0x18141C`,
+  `0x1DD4D8`, `0x1E3230`, `0x1EBED8`, `0x1EE058` and `0x1F7B04`. vrcam routes them through a counting cave (`play`):
+  0/s at Sensor Adjustment, 45/s in the lobby and in training (EE 100%, no vr90).
+- `0x1BBAD0`/`0x1BBA10` (around the head-tracker guards) belong to the USB camera task, which also runs in Sensor
+  Adjustment. Not usable as a gameplay signal.

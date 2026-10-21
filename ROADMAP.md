@@ -8,6 +8,50 @@ Last updated 2026-09-13. Supersedes the 2026-07-02 roadmap, which predated all
 of `camera-tracking/re/` and `camera-tracking/synth/` and still referenced the
 `police247-rig/` directory that was folded into `camera-tracking/` in `72ddd2b`.
 
+## VR immersion (Stage 2): open items
+
+Design intent (user, 2026-10-21): you are **in the world**, not looking at a floating display. The current
+state and test order are in `vr/IMMERSIVE.md` and `HANDOFF.md`.
+
+- **Gun model on the motion controller** (added 2026-10-21), like other VR shooters: you see a pistol in
+  your hand that tracks the controller, instead of only the game's flat green aim ring.
+  - **Asset:** a free pistol model, low-poly is fine. Before use, check its licence:
+    - On Fab (Epic), some free listings are restricted to Unreal Engine; we need one licensed for use in
+      any engine.
+    - CC0 sources avoid the question: Kenney, Quaternius, Poly Haven, and CC0/CC-BY models on Sketchfab.
+    - Keep the licence file next to the asset.
+  - **Rendering:** draw it in the pcsx2-vr fork (D3D11), into each eye's texture before the SteamVR submit.
+    - Use the right controller's aim pose and each eye's view/projection. The game has no idea the gun
+      exists.
+    - Draw it on top of the scene. An optional depth test against the game's Z buffer (FBP 256) would let
+      walls hide the gun.
+    - Load glTF/OBJ with a small loader (cgltf/tinyobjloader). Simple lighting is enough.
+  - **Controller pose:** the fork reads it straight from OpenVR (it already calls `WaitGetPoses`), so there
+    is no bridge round trip.
+  - **Alignment:** add a grip offset/rotation in `[VR]`, tuned in the headset so the model sits in the hand
+    and its barrel lines up with the shot ray (`frame_bridge.aim_target`, `AIM_DIST_M`).
+  - **Part of this feature, not optional** (user, 2026-10-21):
+    - **Muzzle flash** at the barrel tip on each shot: a short additive sprite or light burst, in both eyes.
+      - The fork needs to know when the trigger fires: the bridge sets a "fired" slot in EE RAM, or the
+        fork reads the trigger action from OpenVR itself.
+    - **Haptic pulse on fire** on the right controller.
+      - The bridge already has `VR.buzz()`; call it on each trigger edge, with a stronger and sharper
+        pulse than the UI buzzes.
+    - **Sights instead of the flat ring:** a short laser from the barrel, or glowing tritium sights on the
+      model.
+      - Pick one in the headset, and keep the other as a `[VR]` option.
+      - Either way, it must agree with the shot ray.
+    - **Hide the game's own green crosshair ring** in VR, once the gun's sights replace it. Keep it as a
+      `[VR]` option for debugging aim.
+- **HUD placement:** the timer, ammo and ring are drawn flat on each eye with no depth, so they follow your
+  head. Pin the HUD at a comfortable distance, or keep only the essentials.
+- **Menus and title screen:** these have no 3D world behind them. Pick between a head-locked panel, a
+  simple virtual room, or a flat world-locked screen (the last one is the "floating display" the design
+  avoids).
+- **Head-movement parallax:** small head translation goes into the view, separate from the game's
+  lean/duck cover moves.
+- **Comfort for the scripted camera moves** (rails and lean): vignetting during big moves.
+
 ## Two ways in
 
 **Video injection** (`camera-tracking/synth/`) — draw an idealised target into a
