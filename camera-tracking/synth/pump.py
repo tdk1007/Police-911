@@ -10,8 +10,8 @@ would give us a meaningless reading. Two motions are available:
   anim   : a large sweep, to watch whether the tracker actually follows.
 
 control.json:
-  {"mode":"player","dx":0,"dy":0,"fg":255,"bg":0,"filled":true,
-   "head_r":0.11, "shoulder_w":0.34,
+  {"mode":"gauss","dx":0,"dy":0,"fg":255,"bg":0,"filled":true,
+   "head_r":0.11, "shoulder_w":0.34, "sigma":0.085, "aspect":1.0,
    "jitter":0.03, "jitter_hz":3.0,
    "anim":"none"|"sweep_x"|"sweep_y"|"circle", "amp":0.8, "period":4.0}
 """
@@ -24,8 +24,9 @@ sys.path.insert(0, HERE)
 import render
 
 CONTROL = os.path.join(HERE, 'control.json')
-DEFAULT = {"mode": "player", "dx": 0.0, "dy": 0.0, "fg": 255, "bg": 0,
+DEFAULT = {"mode": "gauss", "dx": 0.0, "dy": 0.0, "fg": 255, "bg": 0,
            "filled": True, "head_r": 0.11, "shoulder_w": 0.34,
+           "sigma": 0.085, "aspect": 1.0,
            "jitter": 0.03, "jitter_hz": 3.0,
            "anim": "none", "amp": 0.8, "period": 4.0}
 
@@ -88,6 +89,10 @@ def build(c, dx, dy):
     if mode == "head":                      # head only -- no torso mass at all
         return render.draw_head_only(dx, dy, fg=fg, bg=bg,
                                      head_r=float(c["head_r"]))
+    if mode == "gauss":                     # soft blob, sub-pixel: the good one
+        return render.draw_gaussian(dx, dy, fg=fg, bg=bg,
+                                    sigma=float(c.get("sigma", 0.085)),
+                                    aspect=float(c.get("aspect", 1.0)))
     if mode == "blob":
         return render.pattern_blob(dx, dy, fg=fg, bg=bg)
     if mode == "level":
@@ -112,7 +117,7 @@ def main():
             cam.send(render.to_bgr(build(c, dx, dy)))
             cam.sleep_until_next_frame()
             desc = (c["mode"], c["dx"], c["dy"], c["anim"], c["head_r"],
-                    c["shoulder_w"], c["fg"], c["bg"], c["filled"])
+                    c.get("sigma"), c["fg"], c["bg"], c["filled"])
             if desc != last_desc:
                 print(f"pump: {desc}", flush=True)
                 last_desc = desc

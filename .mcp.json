@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "ghidra-ps2": {
+      "type": "http",
+      "url": "http://127.0.0.1:8092/mcp"
+    },
+    "ghidra-arcade": {
+      "type": "http",
+      "url": "http://127.0.0.1:8091/mcp"
+    },
+    "ghidra-gui": {
+      "type": "stdio",
+      "command": "tools/ghidramcp-venv/Scripts/ghidra-mcp.exe",
+      "args": ["--ghidra-server", "http://127.0.0.1:8080/"]
+    }
+  }
+}

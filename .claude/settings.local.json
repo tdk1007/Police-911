@@ -23,5 +23,10 @@
       "Bash(gh repo *)",
       "PowerShell($g = Get-Command gh -ErrorAction SilentlyContinue; if \\($g\\) { \"gh: $\\($g.Source\\)\"; gh auth status } else { \"gh not found\" }; \"---GIT---\"; $git = Get-Command git -ErrorAction SilentlyContinue; if \\($git\\) { \"git: $\\($git.Source\\)\" } else { \"git not found\" })"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "ghidra-arcade",
+    "ghidra-gui",
+    "ghidra-ps2"
+  ]
 }

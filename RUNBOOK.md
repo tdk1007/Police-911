@@ -157,9 +157,15 @@ That's it. You're playing.
   crouch**; nothing but you moving in the visible background (no doorway with
   foot traffic, no fan, no TV reflection in glass behind you).
 - **Lighting**: a constant room light source on you (floor/ceiling lamp), not
-  just TV glow. The game's motion detection ultimately sees an **80×64
-  grayscale** image — it needs body-vs-background contrast, not resolution.
-  Wear something that contrasts with the wall behind you.
+  just TV glow. The game's motion detection works on a **luminance-only** image
+  and throws colour away entirely (converter disassembled at `0x002285A8` — see
+  `camera-tracking/re/RE_FINDINGS.md`), so it needs body-vs-background
+  *contrast*, not resolution. Wear something that contrasts with the wall behind
+  you.
+  <br>The rig feeds **640×480**. The disc accepts exactly five geometries —
+  320×240, 160×120, 80×60, 48×30, 640×480 (`ovtVideo_init` jump table at
+  `0x00228240`). An earlier revision of this runbook claimed the tracker sees
+  "80×64"; that number appears nowhere in the binary and was wrong.
 
 ## Motion-bridge calibration (fallback path)
 
@@ -211,7 +217,7 @@ Bonus: the bridge and PCSX2 can share the camera through OBS if ever needed
 | Launcher: "NO PS2 BIOS FOUND" | Nothing in `PCSX2\bios` | Step 1. Any `scph*.bin`/`ps2*.bin` ≥512 KB is picked up automatically. |
 | Game: **"USB camera is not connected."** | PCSX2 device dropdown empty/wrong; OBS not running; Link Controller holding the camera | Close Link Controller. PCSX2 `Settings → USB → Port 1`: Webcam (EyeToy) / **Konami Capture Eye** / device "OBS Virtual Camera" (launcher sets this). Still dead → `-Motion bridge` — full body-duck gameplay preserved. |
 | Camera image stretched / zoomed-in in game | Direct Link-2C capture (no 4:3 modes) — PCSX2 mangles the 16:9 stream | Fixed & now default: launcher routes through OBS Virtual Camera (640×480 4:3 center-cut, validated). Just run the .bat without `-CameraName`. |
-| Camera detected, red light doesn't follow head / erratic | Contrast/lighting too poor at 80×64 | Add a lamp on the player, kill HDR/auto-exposure in Link Controller, contrasting clothing, re-run in-game camera setup. |
+| Camera detected, red light doesn't follow head / erratic | Contrast/lighting too poor | Add a lamp on the player, kill HDR/auto-exposure in Link Controller, contrasting clothing, re-run in-game camera setup. |
 | Image zooms/crops mid-session | Auto Framing re-enabled (palm gesture or persistence quirk) | Link Controller: Auto Framing OFF, **Gesture Control OFF**. Verify full-frame at session start. |
 | Gun moves cursor but in-game crosshair drifts from aim | Relative-mouse scaling mismatch | In-game **USB mouse settings**: re-run the aim-at-target-center calibration; tune **Target cursor speed** (full gun sweep across the 4:3 image = full crosshair travel). Sweep into a screen corner any time to hard-resync. |
 | Cursor flies off / aim skewed badly | Second monitor active (absolute mouse spans virtual desktop) | Win+P → TV as only display. |
