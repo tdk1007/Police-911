@@ -1,8 +1,48 @@
-# Handoff — Police 911 VR effort (updated 2026-10-12, late)
+# Handoff — Police 911 VR effort (updated 2026-10-21)
 
 Start here in a fresh session. The approved plan is in
 `C:\Users\tdk10\.claude\plans\ok-i-want-to-sequential-avalanche.md`
 (Stage 1 flatscreen VR → Stage 2 6DOF, on **PS2/PCSX2**).
+
+## ▶ STAGE 2 BUILT, WAITING FOR THE HEADSET (2026-10-21)
+Built and verified without a headset: 90 Hz true stereo (two renders per vsync, 180 renders/s, game speed exact). The runbook and
+test order are in **`vr/IMMERSIVE.md`**. **ACTION NEEDED (user, in the headset):** set the Frame to 90 Hz, run
+`.\Play-Police247.ps1 -Immersive`, then follow the test order in IMMERSIVE.md.
+- **Game-side patches**, in `camera-tracking/re/ram`:
+  - `vrcam.py`: head rotation and FOV. Live-verified, with signs = OpenVR.
+  - `vr90.py`: 50 Hz sim gate, one-shot render state save/restore, two loop passes per vsync.
+  - `vrshot.py`: shots along the gun, because the hit test uses the logic camera with a fixed focal length.
+  - All three selftests PASS. `frame_bridge --immersive` keeps them installed.
+- **Fork** (`pcsx2-vr`, diff saved in `vr/pcsx2-vr.patch`):
+  - eye snapshots and same-tick pairing
+  - `[VR] Mode = dryrun|openvr`
+  - OpenVR submit (D3D11) and pose → EE slots
+  - It only attaches to an already-running SteamVR (VR_Init would otherwise start SteamVR itself).
+  - The OpenVR path is compiled but untested.
+- Measured: the frame spans tan ±0.635 × ±0.443; EE 300% is required (180% gives 45 Hz/eye); 4× upscale holds 90 Hz.
+  Details are in RE_FINDINGS.md (2026-10-21).
+- The fork's `PCSX2.ini` was edited for the tests (90 Hz, EE 300%, D3D11, 4×, [VR]). The launcher re-asserts these settings on each launch. The
+  pre-test copy is `PCSX2.ini.pre-vr90`.
+- New helpers: `pshot.py` (frame grab via savestate, no focus needed) and `gsvram.py` (GS VRAM framebuffer decode from a .p2s).
+- Open: no menu/theater fallback in immersive mode, and no positional parallax (head translation drives lean/duck). See IMMERSIVE.md.
+
+### ▶ NEXT TASKS (in order)
+1. **Headset test (needs the user):** run `vr/IMMERSIVE.md` steps 1–5.
+   - Fix whatever breaks in `pcsx2/GS/VR/VRSession.cpp`: the D3D11 submit, the texture bounds, the pose delay.
+   - Tune `TanH/TanV`, `PoseDelay`, `SwapEyes` and `UnitsPerMetre`.
+   - After any fork edit, re-export the patch:
+     `cd pcsx2-vr; git diff -- . ':!3rdparty/include/openvr/openvr.h' > ..\vr\pcsx2-vr.patch`
+2. **Aim check in VR:** in training (savestate 8: infinite time and ammo), turn your head ±30° and shoot.
+   - The `vrshot.py --status` count `used` must rise with each shot.
+   - If the ring and the hits disagree, check `AIM_DIST_M` (6 m) and the logic-frame math in `frame_bridge.aim_target`.
+3. **Menu/theater fallback:** while vrcam's `applied` counter (`0x4F8038`) stops advancing (title, menus, captions), present a
+   world-locked flat quad instead of full-FOV eyes (IVROverlay, or a quad in the submitted eye textures).
+4. **Positional comfort:** decide whether small head translation (beyond what lean/duck uses) should also go into the view
+   (eye-space translate in the vrcam S_TX slots, with y and z added to vr90's per-eye x).
+5. **Busier scenes:** confirm 180 renders/s holds in heavy firefights and in interval-1 (50 Hz sim) scenes. If not, the fallback
+   is stereo at the achieved rate plus SteamVR reprojection, which already works through `Submit_TextureWithPose`.
+6. Tidy-up: delete the stray `pcsx2-vr/deps/deps`. Debug leftovers: `vr_eye{0,1}.png` dumps every 5 s in `GSRenderer::VRCompose`
+   (remove them, or put them behind a setting).
 
 ## ▶ OPEN BUG (2026-10-20, end of session): VR launch lands on the DESKTOP, not Theater
 The launch chain works end to end. Clicking "Police 24-7 (VR)" in Steam with SteamVR down:
@@ -33,7 +73,7 @@ reprojection from GS colour+Z, with an alternate-frame-eye toggle to compare.
   an EE patch runs the sim step (0x1335D0) only on a 50 Hz accumulator, and the render (0x133690) runs
   twice per vsync, once per eye. That is 180 renders/s and needs EE overclock; the fallback is reprojection.
   See the plan's Phase 1b and the last section of RE_FINDINGS.md.
-- **ON HOLD (user, end of 2026-10-20).** I explained the 90 Hz options. Comfort needs the head view at 90 Hz;
+- **(Superseded 2026-10-21: the user said continue, Phase 1b measured and passed — see the top.) ON HOLD (user, end of 2026-10-20).** I explained the 90 Hz options. Comfort needs the head view at 90 Hz;
   reprojection covers that. Real stereo at 90 Hz is uncertain, 45–50 Hz real stereo + reprojection is likely.
   A recompile is not viable via REA (it can't open MIPS R5900) and would still need a GS/VU renderer, so the
   recommendation is to stay on the emulator. Waiting on the user's go for the Phase 1b measurement.

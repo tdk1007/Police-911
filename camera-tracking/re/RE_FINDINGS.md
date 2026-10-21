@@ -343,3 +343,53 @@ What `0x1B9180` mutates (verified, but the per-object draw callbacks are not exh
   - Sound stays in step because it is tick-driven. Vsync-keyed cosmetics run 1.8× fast.
   - Per-eye stereo on top of that means 180 renders/s and needs EE/VU overclocking.
   - The cheap alternative is 50 Hz stereo plus headset reprojection to 90 Hz.
+
+
+# 2026-10-21: live VR checks, 90 Hz stereo, GS timing, hit test
+
+Live, in the pcsx2-vr fork (v2.6.3) over PINE, savestates 9 (hotel lobby) and 8 (training street).
+
+## vrcam (render camera cave): verified live
+- The cave runs once per rendered view (`applied` = frames/s). With pose 0, the picture is identical to stock.
+- Signs match OpenVR. Yaw +20 turns the view left. Pitch +15 looks up. Roll +30 rotates the picture clockwise, i.e. the head is tilted
+  counter-clockwise (image registration: best match at -30). The eye offset is in eye space, +x = camera right.
+- The HUD stays fixed for every rotation and FOV. The enemy marker circles follow the render view.
+- FOV 1.5 and 2.5 widen the view, and no culling pops even with the stock k values.
+- **Measured projection** (sim frozen, yaw/pitch 3 and 6 degrees, sub-pixel phase correlation): the frame spans **tan +-0.635 h x +-0.443 v**.
+  The glFrustum constants (0.667/0.5) are not the visible extents.
+- Scale: a full duck drops the camera 54.5 units and a full lean moves it about 190 units plus 24 degrees of yaw. So 1 unit is about 1 cm.
+
+## vr90: decoupled 90 Hz render, verified live
+- At `FrameratePAL = 90` the stock game runs 1.8x fast (45 frames/s at interval 2). The patch gates the sim and keeps it at exactly 25 or 50 steps/s.
+- One-shot render state that a re-render needs restored (all pointer resets, so the data survives):
+  - `0x2C9B70` (2D queue end), `0x2C9B60/61` flags, `0x49F400`/`0x49F440` callback queue, `0x3A2EF8` draw hook
+  - the HUD pass `0x1B4B80`:
+    - text list `0x417990..` (write pointer `0x29F0D4`; the end stamps `0xFFFFFFFF` over the first word)
+    - quad list `0x4206A0..` (write pointer `0x29F0E8`, enable byte `0x29F0D1`)
+  - Without the HUD lists, render-only frames lost TIME, the panel and the ammo.
+- Packet buffer: a busy pass (slot 8) is about 1.03 MB of the 2 MB buffer. Two passes in one packet overflowed it (loop dropped to 2 fps).
+  So each eye is its own main-loop iteration: the wait cave at `0x133114` skips the vsync wait after pass 0.
+- Throughput: EE 100% gives 45 loops/s, 180% gives 90 renders/s (45 Hz/eye), **300% gives 180 renders/s**. The EE thread uses about 52% of a
+  9800X3D core and the GS about 15%. At 4x upscale (D3D11) it still holds 90 Hz.
+- GS VRAM layout: framebuffers are 512 wide, PSMCT24, at FBP 0 and 128 (blocks 0x0000/0x1000). Z32 is at FBP 256.
+  Streamed textures and CLUTs are uploaded per draw to 0x3000/0x3004 and 0x3C00/0x3C04.
+
+## GS-side timing, which matters for capturing the eyes
+- The GS runs one packet behind the EE. Each vsync it draws 187 draws into 0x0000, then 187 into 0x1000. There are no uploads or moves into
+  the framebuffers.
+- At vsync, the buffer drawn second lacks its late HUD text (TIME ELAPSED, OFFICER, CONTINUE). Even without VR, the non-displayed buffer
+  never has it, yet GS memory read back later does. A buffer is complete only when the GS starts drawing over it.
+- So the fork snapshots each buffer on the first draw into it, keeps two copies, and pairs the eyes from the same EE vsync.
+  Verified: TIME ELAPSED and the arrow blink phase match in both eyes, with the full HUD.
+
+## Hit test: world space, logic camera, fixed focal (static, subagent, decompiled)
+- The fire handler is `0x185040`. The shot coordinates come from the getter `0x1BA6F0` (0x420690/92 at the trigger edge), called at
+  `0x1857EC` and `0x18583C`. The getter's other 12 callers are menus and front end.
+- Ray builder `0x184D80(x, y, &org, &dir)`:
+  - It copies the pose from `0x2C60E0` (roll is ignored) and uses its own matrix code (`0x14C740`/`0x14CDA0`/`0x14CF80`/`0x14CFD0`).
+  - The crosshair angles are `h = -atan2(x-256, 402)` and `v = atan2(-(y-256)*384/512*0.94*cos h, 402)` in a 512 space.
+  - The ray is `dir = M*(0,0,-3000)`. 256/402 = 0.637, which matches the measured tan_h.
+- Aim assist is `0x18C8B0`: point-to-ray distance to enemy bones (`0x2502C0`), bending the shot.
+- Collision is `0x190060` → `0x18F250`, against the list `0x3B56EC`: a sphere test, then a mesh test (`0x18E840`).
+- **The hit test ignores the render view, the head rotation and the FOV.**
+- `vrshot.py` retargets the two call sites to a cave that substitutes the bridge's logic-frame shot coordinates.

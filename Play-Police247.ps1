@@ -24,6 +24,7 @@
   .\Play-Police247.ps1 -Phone                   # use the iPhone as the light gun
   .\Play-Police247.ps1 -Gui                     # show the launch checkbox dialog
   .\Play-Police247.ps1 -Vr                      # SteamVR: PINE + windowed + frame_bridge
+  .\Play-Police247.ps1 -Immersive               # Stage 2: pcsx2-vr fork renders in the headset
   .\Play-Police247.ps1 -DryRun                  # show what would happen
 #>
 param(
@@ -38,6 +39,7 @@ param(
     [switch]$Pine,                      # enable PCSX2's PINE IPC (memory tooling)
     [switch]$NoFullscreen,
     [switch]$Vr,                        # Steam Frame / SteamVR play (implies -Pine -NoFullscreen)
+    [switch]$Immersive,                 # Stage 2: the pcsx2-vr fork as a SteamVR scene app (implies -Vr)
     [switch]$DryRun
 )
 
@@ -63,6 +65,15 @@ $script:BridgeProc = $null
 $VrBridge = Join-Path $Root 'vr\frame_bridge.py'
 $VrLog    = Join-Path $Root 'vr\bridge.log'
 
+# Immersive VR: the pcsx2-vr fork (portable, own config) renders both eyes into the
+# headset itself, so no Theater screen and no aim calibration.
+if ($Immersive) {
+    $Vr = $true
+    $Pcsx2   = Join-Path $Root 'pcsx2-vr\bin\pcsx2-qtx64-avx2.exe'
+    $Ini     = Join-Path $Root 'pcsx2-vr\bin\inis\PCSX2.ini'
+    $BiosDir = Join-Path $Root 'pcsx2-vr\bin\bios'
+}
+
 # VR mode: the game must run windowed (SteamVR shows it on the Theater screen) and
 # PINE must be on (frame_bridge writes lean/duck + aim into game RAM). Motion stays
 # 'synth' unless asked otherwise: the game needs an emulated camera present to boot
@@ -81,7 +92,22 @@ $VrGameId = '17657713875153321984'
 # desktop instead of the Theater screen. So if it is down: start SteamVR, wait for
 # it, then have Steam launch the shortcut again once this copy has exited (Steam
 # ignores a launch request for a game it still thinks is running).
-if ($Vr -and -not $DryRun -and -not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+if ($Immersive -and -not $DryRun -and -not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+    # The fork is its own SteamVR app: just make sure SteamVR is up before it boots.
+    Write-Host 'SteamVR is not running - starting it. Put the Frame on / connect it to this PC.'
+    Start-Process 'steam://rungameid/250820'
+    $deadline = (Get-Date).AddMinutes(2)
+    while (-not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Host 'SteamVR did not start within 2 minutes. Start it by hand, then launch again.' -ForegroundColor Red
+            Start-Sleep -Seconds 8
+            exit 1
+        }
+        Start-Sleep -Seconds 2
+    }
+    Start-Sleep -Seconds 8      # let the compositor settle
+}
+elseif ($Vr -and -not $Immersive -and -not $DryRun -and -not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
     Write-Host 'SteamVR is not running - starting it. Put the Frame on / connect it to this PC.'
     Start-Process 'steam://rungameid/250820'
     $deadline = (Get-Date).AddMinutes(2)
@@ -446,7 +472,21 @@ switch ($Motion) {
 if ($Phone) { Start-GunHelper }
 
 # ------------------------------------------------------------------ SteamVR
-if ($Vr) {
+if ($Immersive) {
+    # The fork's VR profile (see vr\IMMERSIVE.md): OpenVR output on D3D11, PAL vsync at
+    # 90 Hz with the EE at 300% for two renders per vsync; the game-side patches that
+    # use this are installed by frame_bridge --immersive.
+    Write-Host 'Immersive VR: pcsx2-vr fork, D3D11, 90 Hz stereo'
+    if (-not $DryRun) {
+        Set-IniValue $Ini 'VR' 'Mode' 'openvr'
+        Set-IniValue $Ini 'EmuCore/GS' 'Renderer' '3'
+        Set-IniValue $Ini 'EmuCore/GS' 'upscale_multiplier' '4'   # 2048x1792 per eye; 90 Hz holds (2026-10-21)
+        Set-IniValue $Ini 'EmuCore/GS' 'FrameratePAL' '90'
+        Set-IniValue $Ini 'EmuCore/GS' 'VsyncEnable' 'false'
+        Set-IniValue $Ini 'EmuCore/Speedhacks' 'EECycleRate' '3'
+    }
+}
+elseif ($Vr) {
     if (-not (Test-Path -LiteralPath (Join-Path $Root 'vr\calib.json'))) {
         Write-Host 'No vr\calib.json yet: the bridge will run its aim calibration first.'
     }
@@ -475,7 +515,8 @@ if ($Vr) {
     $script:BridgeProc = Start-Process -FilePath 'cmd.exe' -PassThru -WindowStyle Minimized `
         -WorkingDirectory (Split-Path $VrBridge) `
         -ArgumentList ('/c ' + $py.Exe + ' ' + ($py.Args -join ' ') + ' -u "' + $VrBridge +
-                       '" -v > "' + $VrLog + '" 2>&1')
+                       '" -v' + $(if ($Immersive) { ' --immersive' } else { '' }) +
+                       ' > "' + $VrLog + '" 2>&1')
 }
 
 # Wait for the game to exit, then tear down whatever this launcher started

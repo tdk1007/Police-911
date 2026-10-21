@@ -13,6 +13,7 @@ theatre view). Then:
     py frame_bridge.py                 # play
     py frame_bridge.py --dry           # no PINE / no clicks; print what would be sent
     py frame_bridge.py --voice-only    # just the left-hand push-to-talk, no game
+    py frame_bridge.py --immersive     # Stage 2: pcsx2-vr fork renders in the headset
 
 Aim calibration: the right controller's aim ("tip") ray is intersected with a
 plane SCREEN_M in front of the calibrated stance, and a homography maps those hit
@@ -394,10 +395,152 @@ def run(vr, cal, dry=False, verbose=False, ptt=None):
             p.close()
 
 
+# --- Stage 2: immersive (pcsx2-vr fork, [VR] Mode = openvr) ------------------------
+AIM_DIST_M = 6.0     # the gun ray is aimed at the point this far along it
+STOCK_TAN = (0.635, 0.443)   # stock frame half-extents (tan), measured 2026-10-21
+S_RECENTER = 0x48            # vrcam slot the fork watches: nonzero = re-zero head yaw
+
+
+def aim_target(hmd, gun, yaw0):
+    """The point AIM_DIST_M along the gun's aim ray, relative to the head, in (head
+    frame, neutral-facing frame). The neutral-facing frame is the game camera's."""
+    (Rh, th), (Rg, tg) = hmd, gun
+    p = tg + AIM_DIST_M * (-Rg[:, 2]) - th
+    return Rh.T @ p, yaw_rot(yaw0).T @ p
+
+
+def project_aim(hmd, gun, yaw0, render_tan, frame='render'):
+    """Gun ray -> crosshair (u, v) in 0..1 of the game picture.
+
+    'render' projects through the head-rotated render camera (where the player sees
+    the target, so the green ring sits on it); 'logic' through the game's unrotated
+    camera (head yaw ignored)."""
+    q_head, q_game = aim_target(hmd, gun, yaw0)
+    q = q_head if frame == 'render' else q_game
+    if q[2] > -1e-3:
+        return None
+    x, y = q[0] / -q[2], q[1] / -q[2]                # tangents, +y up
+    u = 0.5 + 0.5 * x / render_tan[0]
+    v = 0.5 - 0.5 * y / render_tan[1]
+    return min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)
+
+
+class Patches:
+    """Keeps the game-side VR patches (vrcam + vr90 stereo) installed. A savestate load
+    or a reset restores the original code, so this re-checks once a second."""
+    def __init__(self, p, hz=90):
+        import vrcam, vr90, vrshot
+        self.p, self.hz, self.vrcam, self.vr90, self.vrshot = p, hz, vrcam, vr90, vrshot
+        self.next = 0.0
+        self.render_tan = STOCK_TAN
+
+    def tick(self):
+        if time.time() < self.next:
+            return
+        self.next = time.time() + 1.0
+        try:
+            if (self.vrcam.state(self.p) != 'on' or self.vr90.state(self.p) != 'on'
+                    or self.vrshot.state(self.p) != 'on'):
+                self.vrcam.enable(self.p)
+                self.vr90.enable(self.p, self.hz, stereo=True)
+                self.vrshot.enable(self.p)
+                print('VR patches installed (vrcam + vr90 stereo + vrshot)', flush=True)
+            st = self.vrcam.read_status(self.p)       # FOV as the fork set it
+            if st['fov_scale_h'] and st['fov_scale_v']:
+                self.render_tan = (STOCK_TAN[0] * st['fov_scale_h'], STOCK_TAN[1] * st['fov_scale_v'])
+        except RuntimeError as e:                     # code is neither stock nor patched
+            print(f'VR patches: {e}', flush=True)
+
+    def recenter(self):
+        self.p.write32(self.vrcam.SLOTS + S_RECENTER, 1)
+
+    def shot(self, q_game):
+        """Where a shot goes: the game's hit test casts its ray from its own camera,
+        so give it the gun direction in the game camera's frame (see vrshot.py)."""
+        self.vrshot.set_shot(self.p, None if q_game is None else self.vrshot.shot_coords(q_game))
+
+
+def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
+    """Lean/duck as in Stage 1. The green ring is placed through the head-rotated render
+    camera (where the target is seen); the shot itself goes through the game camera
+    (vrshot.py), because the game's hit test ignores the render view. The fork does the
+    head rotation and stereo itself. No screen calibration: the stance is taken from
+    calib.json if there is one, else from the first head pose (recenter with the grip)."""
+    import pine as P
+    from head_writer import HeadWriter
+    from aim_writer import AimWriter
+    p = wait_for_game(P)
+    head, aim, patches = HeadWriter(p), AimWriter(p), Patches(p)
+    t0 = np.array(cal['t0']) if cal else None
+    yaw0 = cal['yaw0'] if cal else None
+    print(f'immersive bridge running (aim frame: {aim_frame}) -- Ctrl+C to stop. '
+          f'Hold right GRIP 1.5 s to recenter.', flush=True)
+    firing, grip_since, last_print = False, None, 0
+    try:
+        while True:
+            patches.tick()
+            poses = vr.poses()
+            hmd = vr.hmd(poses)
+            pose, st = vr.controller(poses, vr.right())
+            if hmd is not None and t0 is None:
+                t0, yaw0 = hmd[1].copy(), yaw_of(hmd[0])
+
+            dx = dy = u = v = None
+            q_game = None
+            if hmd is not None:
+                dx, dy = head_offsets(hmd, t0, yaw0)
+                head.set(dx, dy)
+                if pose is not None:
+                    uv = project_aim(hmd, pose, yaw0, patches.render_tan, aim_frame)
+                    if uv:
+                        u, v = uv
+                    q_game = aim_target(hmd, pose, yaw0)[1]
+            patches.shot(q_game)
+
+            if st:
+                if not firing and st['trigger'] > TRIG_ON:
+                    firing = True
+                elif firing and st['trigger'] < TRIG_OFF:
+                    firing = False
+                if st['grip']:
+                    grip_since = grip_since or time.time()
+                    if time.time() - grip_since > RECENTER_S and hmd is not None:
+                        t0, yaw0 = hmd[1].copy(), yaw_of(hmd[0])
+                        patches.recenter()
+                        beep(600); beep(900)
+                        grip_since = float('inf')
+                else:
+                    grip_since = None
+            if ptt:
+                voice_tick(vr, ptt)
+            aim.set(u, v, firing if st else None)
+
+            if verbose and time.time() - last_print > 0.25:
+                last_print = time.time()
+                hs = f'lean={dx:+.2f} duck={dy:+.2f}' if dx is not None else 'hmd=?'
+                a = f'aim=({u:.2f},{v:.2f})' if u is not None else 'aim=?'
+                t = f"trig={st['trigger']:.2f}{' FIRE' if firing else ''}" if st else 'trig=?'
+                print(f'{hs}  {a}  {t}  tan={patches.render_tan[0]:.2f}x{patches.render_tan[1]:.2f}',
+                      flush=True)
+            time.sleep(1 / HZ)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if ptt:
+            ptt.release()
+        aim.release()
+        head.neutral()
+        p.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--calibrate', action='store_true')
+    ap.add_argument('--immersive', action='store_true',
+                    help='Stage 2: pcsx2-vr fork in the headset (no screen calibration)')
+    ap.add_argument('--aim-frame', choices=('render', 'logic'), default='render',
+                    help='immersive: project the gun through the head-rotated or the game camera')
     ap.add_argument('--dry', action='store_true', help='no PINE writes, no clicks; print')
     ap.add_argument('-v', '--verbose', action='store_true')
     ap.add_argument('--voice-only', action='store_true', help='only left-hand push-to-talk')
@@ -417,6 +560,12 @@ def main():
     try:
         if args.voice_only:
             return voice_only(vr, ptt)
+        if args.immersive:
+            cal = None
+            if os.path.exists(CALIB):
+                with open(CALIB) as f:
+                    cal = json.load(f)
+            return run_immersive(vr, cal, verbose=args.verbose, ptt=ptt, aim_frame=args.aim_frame)
         if args.calibrate or not os.path.exists(CALIB):
             cal = calibrate(vr)
             if args.calibrate:
