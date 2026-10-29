@@ -5,9 +5,10 @@ theatre view). Then:
     headset position vs. a calibrated neutral  -> lean / duck   (head_writer)
     right controller pointing at the picture   -> crosshair     (aim_writer, RAM write)
     right trigger                              -> fire          (real left click)
-    left controller held at the mouth ("radio mic") -> Claude Code /voice push-to-talk
-                                                  (voice_ptt: focuses the terminal,
-                                                  holds Space, gives focus back)
+    left controller held at the mouth ("radio mic") -> talk to Claude Code, hear it reply
+                                                  (claude_voice: headless Opus session,
+                                                  never touches focus; --voice-terminal
+                                                  for the old /voice push-to-talk)
 
     py frame_bridge.py --calibrate     # once per setup: neutral stance + 4 corners
     py frame_bridge.py                 # play
@@ -40,6 +41,10 @@ CALIB = os.path.join(HERE, 'calib.json')
 LEAN_M = 0.40        # metres of sideways neck travel for a full lean
 SCREEN_M = 3.0       # assumed distance to the theater screen (SteamVR defaultTheaterDistance)
 DUCK_M = 0.22        # metres of neck drop for a full duck
+# Immersive: 1:1 with the game camera, which a full lean moves ~190 units (+24 deg yaw) and a
+# full duck drops 54.5 units, 1 unit ~ 1 cm (RE_FINDINGS 2026-10-21). Stage 1's 0.40/0.22
+# made a head tilt throw the camera ~5x as far in the headset (user, 2026-10-29).
+IMM_LEAN_M, IMM_DUCK_M = 1.90, 0.545
 NECK = np.array([0.0, -0.10, 0.08])  # neck pivot in the HMD frame (below, behind the eyes):
                                      # head tilts/nods swing the eyes, not this point
 TRIG_ON, TRIG_OFF = 0.60, 0.40
@@ -94,6 +99,8 @@ class VR:
         act = lambda n: self.inp.getActionHandle(f'/actions/bridge/{n}')
         self.a_fire, self.a_recenter, self.a_talk = act('in/fire'), act('in/recenter'), act('in/talk')
         self.a_haptic, self.a_aim = act('out/haptic'), act('in/aim')
+        self.a_debug = {n: act(f'in/{n}') for n in ('loadstate', 'savestate', 'slot_next', 'slot_prev')}
+        self._debug_was = {}
         self.sets = (openvr.VRActiveActionSet_t * 1)()
         self.sets[0].ulActionSet = self.inp.getActionSetHandle('/actions/bridge')
         self.sets[0].nPriority = openvr.k_nActionSetOverlayGlobalPriorityMin
@@ -117,7 +124,10 @@ class VR:
             openvr.TrackedControllerRole_LeftHand)
 
     def _digital(self, a):
-        d = self.inp.getDigitalActionData(a, openvr.k_ulInvalidInputValueHandle)
+        try:
+            d = self.inp.getDigitalActionData(a, openvr.k_ulInvalidInputValueHandle)
+        except openvr.error_code.InputError_NoData:    # before the first updateActionState
+            return None
         return bool(d.bState) if d.bActive else None
 
     def mouth_dist(self, poses):
@@ -135,7 +145,7 @@ class VR:
 
     def talk(self, held=False):
         """Push-to-talk: the radio-mic gesture (left controller held at the mouth)
-        or the talk button (left d-pad down / right A). `held` adds hysteresis so
+        or the talk button (left d-pad down). `held` adds hysteresis so
         wobble doesn't cut the recording."""
         if self._digital(self.a_talk):
             return True
@@ -145,6 +155,26 @@ class VR:
             return held or time.time() - self._mic_since > MIC_DWELL_S
         self._mic_since = None
         return False
+
+    HOLD_S = {'loadstate': 1.0, 'savestate': 1.0}   # these need a hold: a stray tap restarts the stage
+
+    def pressed(self):
+        """Debug buttons (savestate load/save/slot) that fired since the last call: slot
+        buttons on press, load/save once per hold of HOLD_S."""
+        out = []
+        for n, a in self.a_debug.items():
+            down = bool(self._digital(a))
+            since = self._debug_was.get(n)
+            if not down:
+                self._debug_was[n] = None
+            elif since is None:
+                self._debug_was[n] = time.time()
+                if n not in self.HOLD_S:
+                    out.append(n)
+            elif n in self.HOLD_S and time.time() - since >= self.HOLD_S[n]:
+                out.append(n)
+                self._debug_was[n] = float('inf')      # once per hold
+        return out
 
     def buzz(self, ms=30):
         try:
@@ -189,12 +219,12 @@ def pointing(pose, t0, yaw0):
     return np.array([o[0] + s * d[0], o[1] + s * d[1]])
 
 
-def head_offsets(hmd, t0, yaw0):
+def head_offsets(hmd, t0, yaw0, lean_m=LEAN_M, duck_m=DUCK_M):
     """Neck-point displacement from the calibrated stance -> (lean, duck)."""
     R, t = hmd
     Ry = yaw_rot(yaw0)
     o = Ry.T @ ((t + R @ NECK) - (t0 + Ry @ NECK))   # calibrated upright, facing yaw0
-    return o[0] / LEAN_M, -o[1] / DUCK_M          # +x = right, drop = duck
+    return o[0] / lean_m, -o[1] / duck_m          # +x = right, drop = duck
 
 
 def wait_trigger(vr, what, tone):
@@ -399,6 +429,12 @@ def run(vr, cal, dry=False, verbose=False, ptt=None):
 AIM_DIST_M = 6.0     # the gun ray is aimed at the point this far along it
 STOCK_TAN = (0.635, 0.443)   # stock frame half-extents (tan), measured 2026-10-21
 S_RECENTER = 0x48            # vrcam slot the fork watches: nonzero = re-zero head yaw
+# Install gate: the caves sit in BSS, which crt0 zero-fills after the ELF is loaded but
+# before main. Code that already reads "original" may still be pre-crt0 (a cold boot
+# crashed this way 2026-10-29), so install only once a marker in that region has
+# survived SETTLE_S. In the BIOS reads return 0 (TLB miss), so the marker can't stick.
+SENTINEL, SENTINEL_VAL = 0x004FFF00, 0x4B4F5256   # 'VROK', clear of all caves/slots
+SETTLE_S = 3.0
 
 
 def aim_target(hmd, gun, yaw0):
@@ -407,6 +443,23 @@ def aim_target(hmd, gun, yaw0):
     (Rh, th), (Rg, tg) = hmd, gun
     p = tg + AIM_DIST_M * (-Rg[:, 2]) - th
     return Rh.T @ p, yaw_rot(yaw0).T @ p
+
+
+FLAT = (2.5, 2.4, 4 / 3)   # fork [VR] FlatDistance / FlatWidth / FlatAspect (defaults)
+
+
+def flat_aim(gun, t0, yaw0):
+    """Gun ray -> (u, v) on the fork's world-locked flat screen (menus): FLAT[0] m ahead
+    of the neutral head, square to yaw0, centred at head height (VRSession::PlaceFlat)."""
+    Rg, tg = gun
+    Ry = yaw_rot(yaw0)
+    o, d = Ry.T @ (tg - t0), Ry.T @ (-Rg[:, 2])
+    if d[2] > -1e-3:
+        return None
+    s = (-FLAT[0] - o[2]) / d[2]
+    x, y = o[0] + s * d[0], o[1] + s * d[1]
+    u, v = 0.5 + x / FLAT[1], 0.5 - y * FLAT[2] / FLAT[1]
+    return min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)
 
 
 def project_aim(hmd, gun, yaw0, render_tan, frame='render'):
@@ -432,7 +485,42 @@ class Patches:
         import vrcam, vr90, vrshot
         self.p, self.hz, self.vrcam, self.vr90, self.vrshot = p, hz, vrcam, vr90, vrshot
         self.next = 0.0
+        self.armed = None
         self.render_tan = STOCK_TAN
+        self.play, self.play_seen, self.play_next = None, 0.0, 0.0
+
+    def playing(self):
+        """Gameplay (the fork shows stereo) vs menus (the fork shows the flat screen):
+        vrcam's play counter ticks ~50/s in a stage and stalls elsewhere."""
+        now = time.time()
+        if now >= self.play_next:
+            self.play_next = now + 0.1
+            try:
+                n = self.p.read32(self.vrcam.SLOTS + self.vrcam.S_PLAY)
+            except RuntimeError:
+                n = None
+            if n != self.play:
+                self.play, self.play_seen = n, now
+        return now - self.play_seen < 0.3
+
+    def loaded_state(self):
+        """We just loaded a savestate: that game is past crt0, so skip the settle wait
+        once the load has gone through (the load itself is queued to the next vsync)."""
+        self.trust_after = time.time() + 0.5
+        self.next = self.trust_after
+
+    def settled(self):
+        """True once the BSS marker has survived SETTLE_S (crt0 has run)."""
+        if getattr(self, 'trust_after', None) and time.time() >= self.trust_after:
+            self.trust_after = None
+            self.p.write32(SENTINEL, SENTINEL_VAL)
+            self.armed = time.time() - SETTLE_S
+            return True
+        if self.armed is None or self.p.read32(SENTINEL) != SENTINEL_VAL:
+            self.p.write32(SENTINEL, SENTINEL_VAL)
+            self.armed = time.time()
+            return False
+        return time.time() - self.armed >= SETTLE_S
 
     def tick(self):
         if time.time() < self.next:
@@ -441,6 +529,8 @@ class Patches:
         try:
             if (self.vrcam.state(self.p) != 'on' or self.vr90.state(self.p) != 'on'
                     or self.vrshot.state(self.p) != 'on'):
+                if not self.settled():
+                    return
                 self.vrcam.enable(self.p)
                 self.vr90.enable(self.p, self.hz, stereo=True)
                 self.vrshot.enable(self.p)
@@ -460,6 +550,42 @@ class Patches:
         self.vrshot.set_shot(self.p, None if q_game is None else self.vrshot.shot_coords(q_game))
 
 
+class Savestates:
+    """Controller stand-ins for PCSX2's F1-F3 (over PINE, so PCSX2 needn't be focused):
+    left d-pad left/right picks a slot among the existing savestates (beeps once per
+    slot number), right B loads it, left d-pad up saves to slot 1 (a scratch slot, so
+    the lobby/training states can't be overwritten by accident)."""
+    SAVE_SLOT = 1
+    DIR = os.path.join(HERE, '..', 'pcsx2-vr', 'bin', 'sstates')
+
+    def __init__(self, p, slot=9):
+        self.p, self.slot = p, slot
+
+    def existing(self):
+        import re
+        found = {int(m.group(1)) for f in os.listdir(self.DIR)
+                 if (m := re.search(r'\.(\d\d)\.p2s$', f))}
+        return sorted(found | {self.slot})
+
+    def press(self, what):
+        if what in ('slot_next', 'slot_prev'):
+            s = self.existing()
+            i = s.index(self.slot) + (1 if what == 'slot_next' else -1)
+            self.slot = s[i % len(s)]
+            print(f'savestate slot {self.slot}', flush=True)
+            for _ in range(self.slot):
+                beep(700, 60)
+        elif what == 'loadstate':
+            print(f'loading savestate slot {self.slot}', flush=True)
+            self.p.load_state(self.slot)
+            beep(900)
+        elif what == 'savestate':
+            print(f'saving savestate slot {self.SAVE_SLOT}', flush=True)
+            self.p.save_state(self.SAVE_SLOT)
+            self.slot = self.SAVE_SLOT
+            beep(500)
+
+
 def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
     """Lean/duck as in Stage 1. The green ring is placed through the head-rotated render
     camera (where the target is seen); the shot itself goes through the game camera
@@ -469,10 +595,16 @@ def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
     import pine as P
     from head_writer import HeadWriter
     from aim_writer import AimWriter
+    import voice_ptt
     p = wait_for_game(P)
-    head, aim, patches = HeadWriter(p), AimWriter(p), Patches(p)
-    t0 = np.array(cal['t0']) if cal else None
-    yaw0 = cal['yaw0'] if cal else None
+    # A trigger pull brings PCSX2 forward first: the click only reaches the game focused
+    aim = AimWriter(p, focus=lambda: voice_ptt.focus(voice_ptt.find_exe_window('pcsx2')))
+    # deadzone ~1.5 cm of real lean (the default 0.04 is 7.6 cm at the 1:1 scale)
+    head = HeadWriter(p, deadzone=0.015 / IMM_LEAN_M)
+    patches, slots = Patches(p), Savestates(p)
+    # Neutral = the first head pose, as in the fork (its yaw zero and flat-screen spot);
+    # calib.json's Stage 1 stance would disagree with both until the first recentre.
+    t0 = yaw0 = None
     print(f'immersive bridge running (aim frame: {aim_frame}) -- Ctrl+C to stop. '
           f'Hold right GRIP 1.5 s to recenter.', flush=True)
     firing, grip_since, last_print = False, None, 0
@@ -485,16 +617,18 @@ def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
             if hmd is not None and t0 is None:
                 t0, yaw0 = hmd[1].copy(), yaw_of(hmd[0])
 
-            dx = dy = u = v = None
+            dx = dy = u = v = uv = None
             q_game = None
             if hmd is not None:
-                dx, dy = head_offsets(hmd, t0, yaw0)
+                dx, dy = head_offsets(hmd, t0, yaw0, IMM_LEAN_M, IMM_DUCK_M)
                 head.set(dx, dy)
-                if pose is not None:
+                if pose is not None and patches.playing():
                     uv = project_aim(hmd, pose, yaw0, patches.render_tan, aim_frame)
-                    if uv:
-                        u, v = uv
                     q_game = aim_target(hmd, pose, yaw0)[1]
+                elif pose is not None:                # menus: the flat screen is world-locked
+                    uv = flat_aim(pose, t0, yaw0)
+                if pose is not None and uv:
+                    u, v = uv
             patches.shot(q_game)
 
             if st:
@@ -513,7 +647,17 @@ def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
                     grip_since = None
             if ptt:
                 voice_tick(vr, ptt)
+            was_down = aim.down
             aim.set(u, v, firing if st else None)
+            if firing and not was_down:
+                used = p.read32(patches.vrshot.B + patches.vrshot.S_USED)
+                print(f'fire: click {"sent" if aim.down else "BLOCKED (PCSX2 not focused)"}, '
+                      f'aim=({u},{v}) vrshot used={used} play={patches.playing()}', flush=True)
+            for b in vr.pressed():
+                slots.press(b)
+                if b == 'loadstate':
+                    patches.loaded_state()
+                vr.buzz(60)
 
             if verbose and time.time() - last_print > 0.25:
                 last_print = time.time()
@@ -545,13 +689,29 @@ def main():
     ap.add_argument('-v', '--verbose', action='store_true')
     ap.add_argument('--voice-only', action='store_true', help='only left-hand push-to-talk')
     ap.add_argument('--no-voice', action='store_true', help='disable push-to-talk')
+    ap.add_argument('--voice-terminal', action='store_true',
+                    help='old push-to-talk: focus the Claude Code terminal and drive /voice')
     ap.add_argument('--voice-title', default='',
-                    help='text in the Claude Code terminal title, if several are open')
+                    help='--voice-terminal: text in the Claude Code terminal title')
+    ap.add_argument('--voice-effort', choices=('low', 'medium', 'high', 'xhigh', 'max'),
+                    help='Opus effort for the voice session (lower = faster replies)')
+    ap.add_argument('--voice-fresh', action='store_true',
+                    help='start a new headless Opus session instead of resuming the last one')
     args = ap.parse_args()
     ptt = None
-    if not args.no_voice:
+    if args.no_voice:
+        pass
+    elif args.voice_terminal:
         from voice_ptt import PushToTalk
         ptt = PushToTalk(args.voice_title)
+    else:
+        from claude_voice import ClaudeVoice, AlreadyRunning
+        try:
+            ptt = ClaudeVoice(fresh=args.voice_fresh, effort=args.voice_effort)
+        except AlreadyRunning as e:
+            if args.voice_only:
+                raise SystemExit(str(e))
+            print(f'voice: {e}; leaving push-to-talk to it', flush=True)
     try:
         vr = VR()
     except openvr.OpenVRError as e:

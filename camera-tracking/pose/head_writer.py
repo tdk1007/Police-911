@@ -27,8 +27,9 @@ class HeadWriter:
     def set(self, dx, dy):
         dx = max(-1.0, min(1.0, dx))
         dy = max(0.0, min(1.0, dy))
-        if abs(dx) < self.deadzone:
-            dx = 0.0
+        # soft deadzone: subtract it rather than snap, so leaving it is not a jump
+        dz = self.deadzone
+        dx = 0.0 if abs(dx) < dz else (dx - dz if dx > 0 else dx + dz) / (1.0 - dz)
         now = time.time()
         if self.t is None or not self.smooth_hz:
             self.dx, self.dy = dx, dy

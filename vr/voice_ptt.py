@@ -76,6 +76,24 @@ def find_terminal(title=''):
     return found[0] if found else None
 
 
+def find_exe_window(prefix):
+    """The largest visible top-level window of a process whose exe starts with prefix."""
+    best, area = None, 0
+
+    @ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+    def cb(h, _):
+        nonlocal best, area
+        if _u32.IsWindowVisible(h) and _exe(h).startswith(prefix):
+            r = W.RECT()
+            _u32.GetWindowRect(h, ctypes.byref(r))
+            a = (r.right - r.left) * (r.bottom - r.top)
+            if a > area:
+                best, area = h, a
+        return True
+    _u32.EnumWindows(cb, 0)
+    return best
+
+
 def focus(hwnd):
     """SetForegroundWindow from a background process: attach to the current
     foreground thread's input first; fall back to the Alt-tap trick."""

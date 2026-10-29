@@ -4,6 +4,48 @@ Start here in a fresh session. The approved plan is in
 `C:\Users\tdk10\.claude\plans\ok-i-want-to-sequential-avalanche.md`
 (Stage 1 flatscreen VR → Stage 2 6DOF, on **PS2/PCSX2**).
 
+## ▶ FIRST HEADSET SESSION (2026-10-29): stereo works, warping fixed. NEXT: trigger + crosshair
+Played in the headset (lobby, slot 9). Launch: `powershell -ExecutionPolicy Bypass -File .\Play-Police247.ps1 -Immersive`
+(scripts are blocked by the execution policy otherwise). Then hold **right B** 1 s to load the lobby, hold the
+**right grip** 1.5 s to recenter.
+
+Fixed tonight (all in the working tree and in this commit):
+- **Cold-boot crash:** the bridge installed the patches before crt0 zero-filled BSS (the caves live there).
+  `frame_bridge.Patches` now waits until a marker at `0x4FFF00` survives 3 s (skipped right after its own
+  savestate loads). Also: in the BIOS, reads of unmapped code return 0 = NOP, so `wait_for_game` passes early.
+- **PINE write race (crash #1 of 10/22, hit twice tonight):** fork `PINE.cpp` `PineWrite` sends writes to
+  protected (recompiled) pages through `Host::RunOnCPUThread(..., block)`; they run at the next vsync
+  (`PollInputOnCPUThread`). Data writes stay direct. ~10 savestate loads + reinstalls since, no crash.
+- **Vertical warping ("10 mm looking up, 50 mm looking down"):** `GetProjectionRaw`'s top/bottom are the
+  y-up tangents of the LOWER/UPPER edges (checked against `GetProjectionMatrix`: the Frame's eye sees 1.17 up,
+  1.73 down). `VRSession::Present` had them swapped (0.56 tan vertical offset). User confirmed fixed. The game's
+  projection centre was measured at exactly the frame centre (zoom/roll fixed point 0.500, 0.501), and the
+  roll affine confirms TanH/TanV = 0.635/0.443. User: "FOV might still be off, but it's stable".
+- **Menus:** on the flat screen the ring now follows the gun ray onto the world-locked screen (`flat_aim`),
+  not the head-rotated render frame (it moved inverted with the head).
+- **Lean/duck 1:1** in immersive (`IMM_LEAN_M` 1.90 / `IMM_DUCK_M` 0.545: a full game lean moves the camera
+  ~190 units + 24 deg yaw). The deadzone is now soft and ~1.5 cm (it was 7.6 cm at that scale = a jump).
+  Still to do: cancel the game's lean displacement/yaw from the view and add real head translation instead.
+- **Controller debug buttons** (`Savestates`): right B hold 1 s = load the selected slot (default 9), left
+  d-pad left/right = pick slot (beeps), left d-pad up hold 1 s = save to slot 1. F1/F2/F3/Esc hotkeys are
+  now written into the fork's ini by the launcher.
+- Neutral stance in immersive = the first head pose (as the fork), not calib.json.
+- Fork logs `VR: eye crop source rect` once (it is 0,0-512,512, 2048x2048 at 4x).
+
+**NEXT (in order, no headset needed until the end):**
+1. **Trigger.** The bridge now focuses PCSX2 before clicking (`AimWriter(focus=...)`), and the log line
+   `fire: click sent ... vrshot used=N` shows every pull reaching PCSX2 with `used` rising ~10 per pull. Yet
+   the user saw at most one shot. Suspects: the substituted shot coords (`vrshot.shot_coords`) land at the
+   0/511 clamp = an off-screen shot, which is a RELOAD in this game; or `used` counts every tick a shot is
+   pending, not shots. Test on the desktop (Mode = off, slot 9): arm vrshot with (256,256), focus PCSX2,
+   SendInput click, compare ammo before/after (pshot.py); then log the coords the bridge substitutes.
+2. **Crosshair too big** (HUD spans the widened frame, ~2.8x h / 4.1x v, and anisotropic). Plan: scale each
+   2D quad about its own centre by stock/VR tan (keeps positions, so the ring still sits on the gun ray).
+   Quad list `0x4206A0..`, write pointer `0x29F0E8`, enable `0x29F0D1`; the ring's screen-space aim copy is at
+   `0x420688/8A`. Find the ring's quad (move AIM, diff the list), then patch the HUD pass `0x1B4B80` or the
+   list consumer. Start the Ghidra server first: `ghidra-mcp\start.cmd ps2`.
+3. Headset check of 1–2, then the FOV feel, then positional parallax (item 4 below).
+
 ## ▶ STAGE 2 BUILT, WAITING FOR THE HEADSET (2026-10-21)
 Built and verified without a headset: 90 Hz true stereo (two renders per vsync, 180 renders/s, game speed exact). The runbook and
 test order are in **`vr/IMMERSIVE.md`**. **ACTION NEEDED (user, in the headset):** set the Frame to 90 Hz, run
@@ -38,6 +80,38 @@ test order are in **`vr/IMMERSIVE.md`**. **ACTION NEEDED (user, in the headset):
     stopgap so the menus are usable in the first headset test, not a decision.
   - Eye PNG dumps are now behind `[VR] DumpEyes` (off). The stray `pcsx2-vr/deps/deps` was deleted (1.3 GB; the build
     never used it, verified by rebuilding without it).
+
+### ▶ PRE-HEADSET FIXES (2026-10-22, after a Fable review) — built and desktop-checked, NOT COMMITTED
+Fork changes (all in `vr/pcsx2-vr.patch`) plus a launcher line:
+- **C1 init race:** `Init` publishes the compositor and an atomic `ready` only after the eye geometry is set. The EE
+  thread used to be able to divide by `tan_h == 0`.
+- **C2 stream-ordered poses:** at each vsync the EE queues `S_POSE_USED` to the GS thread (`MTGS::RunOnGSThread`),
+  each eye snapshot records it, and `PickPose` uses the LOWER of the two eye tags. The GS runs one packet behind, so
+  pass R's tag reads one too high; measured on the desktop as always N/N+1. `PoseDelay` is now only a fallback.
+  Measured: **lag a constant 2.00 vsyncs**, 450/450 pairs tagged in the lobby and in training.
+- **C3 texture lifetime:** snapshots are released in `PurgeTextureCache`/`Destroy`, and `CloseGSDevice` calls
+  `VRSession::OnDeviceClosing` (the overlay texture is cleared, flat textures freed). This replaces the device
+  pointer comparison. Not exercised live (a renderer switch is needed to trigger it).
+- **C4 snapshot guard:** only draws into the two display buffers (`BufferTracker::Knows`) snapshot or end a frame.
+- **Logging:** each eye's `GetProjectionRaw` line at init; return codes of every OpenVR call (first 3 failures per
+  call); a 5 s stats line `VR: 5 s: N pairs (tagged, lag, fixed-delay, eyes >1 tag apart), flat`.
+- **Launcher:** `VsyncQueueSize = 0` in the `-Immersive` profile. 180 renders/s still holds.
+- **Debug:** `[VR] FakeHead = true` tags poses without a headset (dryrun), for repeating the C2 check.
+- Desktop checks passed: Sensor Adjustment stays flat; lobby and training go stereo; stall → flat → stereo.
+
+**Open from tonight (look at these first next session):**
+1. **(FIXED 2026-10-29, see the top) CRASH: PINE code patching races the EE recompiler.** PINE writes EE memory from its own socket thread
+   (`pcsx2/PINE.cpp:615` `memWrite32`), and a write over compiled code runs `recClear` concurrently with the EE thread.
+   It crashed once tonight (minidump `pcsx2-vr/bin/crash-2026-10-22-00-09-40-201.dmp`, `recClear` iR5900.cpp:777) while
+   `vr90.py --on` was installing right after a savestate load. Every patch install (and the bridge's reinstall after
+   savestate loads) is exposed. Proposed fork fix: queue PINE writes and apply them on the EE thread at vsync
+   (`VSyncStart`, next to `OnEEVsync`), with the PINE thread waiting for completion; if the VM is paused, write
+   directly. Dump reader: `vr/crashdump.py` (minidump exception + stack scan, then `llvm-symbolizer` from
+   VS Build Tools `VC/Tools/Llvm/x64/bin`; no cdb is installed).
+2. **Red ◄◄ arrow in one eye only** (training, screenshot): TIME ELAPSED matches in both eyes, so it's the same sim
+   tick, but a blinking arrow showed in the left eye only. Either the blink runs per render pass (harmless), or the C4
+   guard changed the pairing. Sample several frames, then compare with the guard off.
+3. Commit tonight's work (fork patch, launcher, HANDOFF) once 1–2 are understood.
 
 ### ▶ NEXT TASKS (in order)
 1. **Headset test (needs the user):** run `vr/IMMERSIVE.md` steps 1–6 (6 = the new flat screen).

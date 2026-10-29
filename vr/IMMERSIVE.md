@@ -58,6 +58,8 @@ It also starts `frame_bridge.py -v --immersive`, which logs to `vr\bridge.log`.
 | `StereoAfter` / `FlatAfter` | 3 / 15 | Gameplay ticks before switching to stereo, and vsyncs without a tick before switching to the flat screen |
 | `FlatDistance` / `FlatWidth` / `FlatAspect` | 2.5 / 2.4 / 1.333 | The flat screen's distance and width in metres, and its picture aspect |
 | `Menus` | world | Outside gameplay: `world` (flat screen standing in the room), `head` (fixed in front of the face), `stereo` (no flat screen; menus fill the view). ROADMAP's design intent avoids floating displays, so this is for comparing in the headset |
+| `PoseDelay` (now) | 2 | Only a fallback: poses are matched to the eye pair by stream-ordered tags. The 5 s log line shows the measured lag (2.00 on the desktop) |
+| `FakeHead` | false | Debug: tag poses without a headset (dryrun), so the 5 s stats line can be checked on the desktop |
 | `DumpEyes` | false | Debug: write `logs/vr_eye{0,1}.png` every 5 s |
 
 ## In the headset: test order

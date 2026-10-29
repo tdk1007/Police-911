@@ -44,3 +44,8 @@ pcsx2-vr/
 pcsx2-vr-deps/
 camera-tracking/re/ram/sweeps/**/*.bin
 vr/bridge.log
+
+# --- VR voice link (claude_voice.py) ---
+vr/models/
+vr/claude_voice.session
+vr/claude_voice.log

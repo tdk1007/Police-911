@@ -479,11 +479,20 @@ if ($Immersive) {
     Write-Host 'Immersive VR: pcsx2-vr fork, D3D11, 90 Hz stereo'
     if (-not $DryRun) {
         Set-IniValue $Ini 'VR' 'Mode' 'openvr'
+        # World scale for the IPD: 100 (the duck-depth guess) felt short in the headset
+        # (2026-10-29); a hand-edited value in the ini is kept.
+        if (-not (Get-IniValue $Ini 'VR' 'UnitsPerMetre')) { Set-IniValue $Ini 'VR' 'UnitsPerMetre' '130' }
         Set-IniValue $Ini 'EmuCore/GS' 'Renderer' '3'
         Set-IniValue $Ini 'EmuCore/GS' 'upscale_multiplier' '4'   # 2048x1792 per eye; 90 Hz holds (2026-10-21)
         Set-IniValue $Ini 'EmuCore/GS' 'FrameratePAL' '90'
         Set-IniValue $Ini 'EmuCore/GS' 'VsyncEnable' 'false'
+        Set-IniValue $Ini 'EmuCore/GS' 'VsyncQueueSize' '0'      # EE at most one frame ahead of the GS: less head-pose latency
         Set-IniValue $Ini 'EmuCore/Speedhacks' 'EECycleRate' '3'
+        # The fork's portable config starts with no hotkeys; PCSX2's usual F-key layout
+        Set-IniValue $Ini 'Hotkeys' 'SaveStateToSlot' 'Keyboard/F1'
+        Set-IniValue $Ini 'Hotkeys' 'NextSaveStateSlot' 'Keyboard/F2'
+        Set-IniValue $Ini 'Hotkeys' 'LoadStateFromSlot' 'Keyboard/F3'
+        Set-IniValue $Ini 'Hotkeys' 'OpenPauseMenu' 'Keyboard/Escape'
     }
 }
 elseif ($Vr) {

@@ -63,8 +63,9 @@ def uv_to_aim(u, v):
 
 
 class AimWriter:
-    def __init__(self, pine):
+    def __init__(self, pine, focus=None):
         self.p = pine
+        self.focus = focus        # optional: called to bring PCSX2 forward on a trigger pull
         self.last = None
         self.down = False
         self.blocked = 0          # trigger pulls ignored because PCSX2 wasn't focused
@@ -77,6 +78,8 @@ class AimWriter:
                 self.p.write32(AIM_Y, xy[1] & 0xFFFFFFFF)
                 self.last = xy
         if trigger is not None and trigger != self.down:
+            if trigger and not pcsx2_focused() and self.focus:
+                self.focus()
             if trigger and not pcsx2_focused():
                 self.blocked += 1
                 return self.last

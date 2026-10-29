@@ -1,7 +1,7 @@
 {
   "controller_type": "frame_controller",
   "name": "Police 24/7 bridge - Steam Frame",
-  "description": "Right trigger fires, right grip recenters, left d-pad down / right A = push-to-talk",
+  "description": "Right trigger fires, right grip recenters, left d-pad down = push-to-talk; right B loads the selected savestate, left d-pad left/right picks the slot, left d-pad up saves to slot 1",
   "bindings": {
     "/actions/bridge": {
       "sources": [
@@ -33,11 +33,38 @@
           }
         },
         {
-          "path": "/user/hand/right/input/a",
+          "path": "/user/hand/right/input/b",
           "mode": "button",
           "inputs": {
             "click": {
-              "output": "/actions/bridge/in/talk"
+              "output": "/actions/bridge/in/loadstate"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/dpad_up",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/bridge/in/savestate"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/dpad_right",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/bridge/in/slot_next"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/dpad_left",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/bridge/in/slot_prev"
             }
           }
         }

@@ -45,6 +45,10 @@ state and test order are in `vr/IMMERSIVE.md` and `HANDOFF.md`.
       `[VR]` option for debugging aim.
 - **HUD placement:** the timer, ammo and ring are drawn flat on each eye with no depth, so they follow your
   head. Pin the HUD at a comfortable distance, or keep only the essentials.
+  - Headset report (2026-10-29): the reload magazine graphic (lean in to cover) comes up huge and at the
+    edge of view. Likely cause: the 2D HUD still spans the full 512-wide screen, but in VR that screen now
+    covers the widened FOV (tan 1.76 vs stock 0.64), so HUD sprites are about 2.8x too big. Fix idea:
+    scale and centre the HUD draws to the stock-frame part of the view.
 - **Menus and title screen:** these have no 3D world behind them. Pick between a head-locked panel, a
   simple virtual room, or a flat world-locked screen (the last one is the "floating display" the design
   avoids).
