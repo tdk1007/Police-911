@@ -1,0 +1,41 @@
+{
+ "measured_at": {
+  "width": 1575,
+  "height": 999,
+  "date": "2026-09-13",
+  "sigma": 0.085,
+  "calib": {
+   "neutral_x": 0.532,
+   "neutral_y": 0.5,
+   "range_x": 0.27,
+   "range_y": 0.22
+  }
+ },
+ "panel": {
+  "fx0": 0.3047619047619048,
+  "fx1": 0.48253968253968255,
+  "fy0": 0.18018018018018017,
+  "fy1": 0.5605605605605606
+ },
+ "ring": {
+  "fx": 0.4012698412698413,
+  "fy": 0.3123123123123123,
+  "ftol": 0.014014014014014014
+ },
+ "fit": {
+  "dot_x": {
+   "slope_frac": -0.05492063492063492,
+   "intercept_frac": 0.40012698412698416,
+   "r": -0.9984,
+   "resid_px": 4.81
+  },
+  "dot_y": {
+   "slope_frac": 0.05385385385385385,
+   "intercept_frac": 0.38958958958958956,
+   "r": 0.9931,
+   "resid_px": 6.47
+  }
+ },
+ "settle_seconds": 4.0,
+ "notes": "Tracker vertical output depends on BLOB SIZE, not just position, and is non-monotonic across the full frame. Valid only near sigma=0.085 with the calib above. The ring is not reachable in y at this blob size."
+}

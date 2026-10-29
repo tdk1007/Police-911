@@ -23,10 +23,12 @@
   .\Play-Police247.ps1 -Motion none             # gun only
   .\Play-Police247.ps1 -Phone                   # use the iPhone as the light gun
   .\Play-Police247.ps1 -Gui                     # show the launch checkbox dialog
+  .\Play-Police247.ps1 -Vr                      # SteamVR: PINE + windowed + frame_bridge
+  .\Play-Police247.ps1 -Immersive               # Stage 2: pcsx2-vr fork renders in the headset
   .\Play-Police247.ps1 -DryRun                  # show what would happen
 #>
 param(
-    [ValidateSet('camera', 'bridge', 'none')]
+    [ValidateSet('camera', 'synth', 'bridge', 'none')]
     [string]$Motion = 'camera',
     [string]$CameraName = '',           # DirectShow friendly name override
     [switch]$Obs,                       # use OBS Virtual Camera as the feed
@@ -34,7 +36,10 @@ param(
     [string]$BridgeSource = 'webcam',
     [switch]$Phone,                     # iPhone-as-lightgun: start the UDP->mouse helper
     [switch]$Gui,                       # show a checkbox dialog before launching
+    [switch]$Pine,                      # enable PCSX2's PINE IPC (memory tooling)
     [switch]$NoFullscreen,
+    [switch]$Vr,                        # Steam Frame / SteamVR play (implies -Pine -NoFullscreen)
+    [switch]$Immersive,                 # Stage 2: the pcsx2-vr fork as a SteamVR scene app (implies -Vr)
     [switch]$DryRun
 )
 
@@ -47,6 +52,7 @@ $BiosDir = Join-Path $Root 'PCSX2\bios'
 # (single data track; the XA audio is interleaved in it, nothing is lost)
 $Game   = Join-Path $Root 'Police 24-7 (Europe) (En,Fr,De,Es,It)\Police 24-7 (Europe) (En,Fr,De,Es,It).bin'
 $Bridge = Join-Path $Root 'camera-tracking\bridge\police247_bridge.py'
+$Pump   = Join-Path $Root 'camera-tracking\synth\pump.py'
 $GunHelper = Join-Path $Root 'iPhone Gun\windows\gun_helper.py'
 $PhonePref = Join-Path $Root '.launcher-phone.pref'   # remembers the checkbox state
 
@@ -54,6 +60,82 @@ $PhonePref = Join-Path $Root '.launcher-phone.pref'   # remembers the checkbox s
 $script:StartedObs = $false
 $script:ObsProc    = $null
 $script:GunProc    = $null
+$script:PumpProc   = $null
+$script:BridgeProc = $null
+$VrBridge = Join-Path $Root 'vr\frame_bridge.py'
+$VrLog    = Join-Path $Root 'vr\bridge.log'
+
+# Immersive VR: the pcsx2-vr fork (portable, own config) renders both eyes into the
+# headset itself, so no Theater screen and no aim calibration.
+if ($Immersive) {
+    $Vr = $true
+    $Pcsx2   = Join-Path $Root 'pcsx2-vr\bin\pcsx2-qtx64-avx2.exe'
+    $Ini     = Join-Path $Root 'pcsx2-vr\bin\inis\PCSX2.ini'
+    $BiosDir = Join-Path $Root 'pcsx2-vr\bin\bios'
+}
+
+# VR mode: the game must run windowed (SteamVR shows it on the Theater screen) and
+# PINE must be on (frame_bridge writes lean/duck + aim into game RAM). Motion stays
+# 'synth' unless asked otherwise: the game needs an emulated camera present to boot
+# into play, and the bridge overrides what that camera reports anyway.
+if ($Vr) {
+    $Pine = $true
+    $NoFullscreen = $true
+    if (-not $PSBoundParameters.ContainsKey('Motion')) { $Motion = 'synth' }
+}
+
+# Steam game id of the "Police 24-7 (VR)" shortcut: (appid 4111256887 << 32) | 0x02000000
+# (appid = crc32(exe + name) | 0x80000000, see vr\add_steam_shortcut.py).
+$VrGameId = '17657713875153321984'
+
+# SteamVR must already be up when Steam launches the game, or the game lands on the
+# desktop instead of the Theater screen. So if it is down: start SteamVR, wait for
+# it, then have Steam launch the shortcut again once this copy has exited (Steam
+# ignores a launch request for a game it still thinks is running).
+if ($Immersive -and -not $DryRun -and -not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+    # The fork is its own SteamVR app: just make sure SteamVR is up before it boots.
+    Write-Host 'SteamVR is not running - starting it. Put the Frame on / connect it to this PC.'
+    Start-Process 'steam://rungameid/250820'
+    $deadline = (Get-Date).AddMinutes(2)
+    while (-not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Host 'SteamVR did not start within 2 minutes. Start it by hand, then launch again.' -ForegroundColor Red
+            Start-Sleep -Seconds 8
+            exit 1
+        }
+        Start-Sleep -Seconds 2
+    }
+    Start-Sleep -Seconds 8      # let the compositor settle
+}
+elseif ($Vr -and -not $Immersive -and -not $DryRun -and -not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+    Write-Host 'SteamVR is not running - starting it. Put the Frame on / connect it to this PC.'
+    Start-Process 'steam://rungameid/250820'
+    $deadline = (Get-Date).AddMinutes(2)
+    while (-not (Get-Process vrserver -ErrorAction SilentlyContinue)) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Host 'SteamVR did not start within 2 minutes. Start it by hand, then launch the game again.' -ForegroundColor Red
+            Start-Sleep -Seconds 8
+            exit 1
+        }
+        Start-Sleep -Seconds 2
+    }
+    Write-Host 'SteamVR is up. Relaunching the game through Steam so it opens on the Theater screen...'
+    Start-Sleep -Seconds 8      # let the compositor settle before a game asks for Theater
+    # Ask again only once Steam has let go of this launch: a request that arrives
+    # while Steam still counts the game as running gets stuck as a pending launch.
+    # Steam counts EVERY process this one starts as part of the game (job object),
+    # so the helper is created through WMI, outside that tree; a plain child would
+    # itself keep the "game" alive until after it had already asked.
+    $relaunch = "Wait-Process -Id $PID -ErrorAction SilentlyContinue; Start-Sleep -Seconds 5; " +
+                "Start-Process 'steam://rungameid/$VrGameId'"
+    $cmd = 'powershell.exe -NoProfile -WindowStyle Hidden -Command "' + $relaunch + '"'
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd }
+    if ($r.ReturnValue -ne 0) {
+        Write-Host "Could not schedule the relaunch (WMI code $($r.ReturnValue)). Launch the game again from Steam." -ForegroundColor Red
+        Start-Sleep -Seconds 8
+    }
+    exit 0
+}
 
 # ---------------------------------------------------------------- ini helpers
 function Set-IniValue([string]$Path, [string]$Section, [string]$Key, [string]$Value) {
@@ -284,6 +366,18 @@ $obsExe = @(
     "${env:ProgramFiles(x86)}\obs-studio\bin\64bit\obs64.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
+# ---------------------------------------------------------------------- PINE
+# PCSX2's IPC server, used by camera-tracking\re\ram\* to read and write the
+# running game's memory (the savestate sweep and the tracker-address hunt).
+# Off by default: it opens a local TCP port, so only turn it on when asked.
+if ($Pine) {
+    Write-Host 'PINE: enabled on port 28011 (memory tooling can attach)'
+    if (-not $DryRun) {
+        Set-IniValue $Ini 'EmuCore' 'EnablePINE' 'true'
+        Set-IniValue $Ini 'EmuCore' 'PINESlot' '28011'
+    }
+}
+
 switch ($Motion) {
     'camera' {
         # The Link 2C exposes no 4:3 modes, so PCSX2's direct 320x240 request
@@ -323,6 +417,42 @@ switch ($Motion) {
             }
         }
     }
+    'synth' {
+        # Synthetic camera: pump.py draws an idealised target and pushes it
+        # straight into the OBS Virtual Camera SINK via pyvirtualcam. OBS itself
+        # must NOT run -- both want to own that sink, and whoever loses is
+        # silently starved. So this mode deliberately never starts OBS.
+        $dev = if ($CameraName) { $CameraName } else { 'OBS Virtual Camera' }
+        Write-Host "Motion: synthetic camera (pump.py) -> emulated Capture Eye <- '$dev'"
+
+        if (Get-Process obs64 -ErrorAction SilentlyContinue) {
+            throw ("OBS is running, and it holds the same virtual-camera sink pump.py " +
+                   "needs. Close OBS and retry, or use -Motion camera instead.")
+        }
+        if (-not (Test-Path -LiteralPath $Pump)) { throw "pump.py not found at $Pump" }
+
+        if (-not $DryRun) {
+            Set-IniValue $Ini 'USB1' 'Type' 'webcam'
+            Set-IniValue $Ini 'USB1' 'webcam_subtype' '1'
+            Set-IniValue $Ini 'USB1' 'webcam_device_name' $dev
+
+            $py = Get-PythonCmd
+            if (-not $py) { throw 'Synthetic camera needs Python, which was not found on PATH.' }
+            Write-Host "Starting synthetic camera pump ($($py.Exe))..."
+            $script:PumpProc = Start-Process -FilePath $py.Exe -PassThru `
+                -WorkingDirectory (Split-Path $Pump) `
+                -ArgumentList ($py.Args + @('"' + $Pump + '"'))
+            # The pump must own the sink BEFORE PCSX2 opens the DirectShow filter;
+            # if PCSX2 gets there first it captures a dead device and never recovers.
+            Start-Sleep -Seconds 3
+            if ($script:PumpProc.HasExited) {
+                throw ("pump.py exited immediately (code $($script:PumpProc.ExitCode)). " +
+                       "Usually a missing dependency: pip install -r " +
+                       "camera-tracking\synth\requirements.txt")
+            }
+            Write-Host 'Synthetic camera pump is running.'
+        }
+    }
     'bridge' {
         Write-Host "Motion: Python head-tracking bridge ($BridgeSource) -> holds K (Square/cover)"
         if (-not $DryRun) {
@@ -341,6 +471,36 @@ switch ($Motion) {
 # ------------------------------------------------------------ phone gun helper
 if ($Phone) { Start-GunHelper }
 
+# ------------------------------------------------------------------ SteamVR
+if ($Immersive) {
+    # The fork's VR profile (see vr\IMMERSIVE.md): OpenVR output on D3D11, PAL vsync at
+    # 90 Hz with the EE at 300% for two renders per vsync; the game-side patches that
+    # use this are installed by frame_bridge --immersive.
+    Write-Host 'Immersive VR: pcsx2-vr fork, D3D11, 90 Hz stereo'
+    if (-not $DryRun) {
+        Set-IniValue $Ini 'VR' 'Mode' 'openvr'
+        # World scale for the IPD: 100 (the duck-depth guess) felt short in the headset
+        # (2026-10-29); a hand-edited value in the ini is kept.
+        if (-not (Get-IniValue $Ini 'VR' 'UnitsPerMetre')) { Set-IniValue $Ini 'VR' 'UnitsPerMetre' '130' }
+        Set-IniValue $Ini 'EmuCore/GS' 'Renderer' '3'
+        Set-IniValue $Ini 'EmuCore/GS' 'upscale_multiplier' '4'   # 2048x1792 per eye; 90 Hz holds (2026-10-21)
+        Set-IniValue $Ini 'EmuCore/GS' 'FrameratePAL' '90'
+        Set-IniValue $Ini 'EmuCore/GS' 'VsyncEnable' 'false'
+        Set-IniValue $Ini 'EmuCore/GS' 'VsyncQueueSize' '0'      # EE at most one frame ahead of the GS: less head-pose latency
+        Set-IniValue $Ini 'EmuCore/Speedhacks' 'EECycleRate' '3'
+        # The fork's portable config starts with no hotkeys; PCSX2's usual F-key layout
+        Set-IniValue $Ini 'Hotkeys' 'SaveStateToSlot' 'Keyboard/F1'
+        Set-IniValue $Ini 'Hotkeys' 'NextSaveStateSlot' 'Keyboard/F2'
+        Set-IniValue $Ini 'Hotkeys' 'LoadStateFromSlot' 'Keyboard/F3'
+        Set-IniValue $Ini 'Hotkeys' 'OpenPauseMenu' 'Keyboard/Escape'
+    }
+}
+elseif ($Vr) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'vr\calib.json'))) {
+        Write-Host 'No vr\calib.json yet: the bridge will run its aim calibration first.'
+    }
+}
+
 # ---------------------------------------------------------------- boot PCSX2
 $pcsx2Args = @()
 if (-not $NoFullscreen) { $pcsx2Args += '-fullscreen' }
@@ -355,19 +515,46 @@ if ($DryRun) {
 $pcsx2Proc = Start-Process -FilePath $Pcsx2 -ArgumentList $pcsx2Args `
     -WorkingDirectory (Split-Path $Pcsx2) -PassThru
 
+# frame_bridge waits on PINE by itself until the game's code is loaded, so it can
+# start right away. Its window stays minimised; the log is vr\bridge.log.
+if ($Vr) {
+    $py = Get-PythonCmd
+    if (-not $py) { throw 'VR mode needs Python, which was not found on PATH.' }
+    Write-Host "Starting VR bridge (log: $VrLog)..."
+    $script:BridgeProc = Start-Process -FilePath 'cmd.exe' -PassThru -WindowStyle Minimized `
+        -WorkingDirectory (Split-Path $VrBridge) `
+        -ArgumentList ('/c ' + $py.Exe + ' ' + ($py.Args -join ' ') + ' -u "' + $VrBridge +
+                       '" -v' + $(if ($Immersive) { ' --immersive' } else { '' }) +
+                       ' > "' + $VrLog + '" 2>&1')
+}
+
 # Wait for the game to exit, then tear down whatever this launcher started
 # (OBS + the phone helper). try/finally so cleanup still runs on Ctrl-C.
 try {
+    if ($script:BridgeProc) {
+        Write-Host 'Playing in VR. Close the dashboard (system button) so the controllers reach the game.'
+    }
     if ($script:StartedObs -or $script:GunProc) {
         Write-Host 'Playing. Leave this window open — it closes OBS + the phone helper when you quit the game.'
     }
     if ($pcsx2Proc) { $pcsx2Proc.WaitForExit() }
 }
 finally {
+    if ($script:BridgeProc) {
+        Write-Host 'Stopping VR bridge...'
+        & taskkill.exe /PID $script:BridgeProc.Id /T /F 2>$null | Out-Null
+    }
     if ($script:GunProc) {
         Write-Host 'Stopping phone gun helper...'
         # /T kills the py.exe -> python.exe child tree, not just the launcher stub
         & taskkill.exe /PID $script:GunProc.Id /T /F 2>$null | Out-Null
+    }
+    if ($script:PumpProc) {
+        Write-Host 'Stopping synthetic camera pump...'
+        # Safe to hard-kill: pyvirtualcam's OBS sink is a shared-memory surface
+        # with no lock to orphan. This is NOT the case for obs64 itself, which
+        # must always be closed gracefully or its virtual camera sticks until reboot.
+        & taskkill.exe /PID $script:PumpProc.Id /T /F 2>$null | Out-Null
     }
     if ($script:StartedObs) {
         Write-Host 'Closing OBS gracefully...'

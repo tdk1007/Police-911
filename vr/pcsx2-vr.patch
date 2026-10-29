@@ -1,0 +1,1281 @@
+diff --git a/pcsx2/Counters.cpp b/pcsx2/Counters.cpp
+index f54ed21..70f828e 100644
+--- a/pcsx2/Counters.cpp
++++ b/pcsx2/Counters.cpp
+@@ -7,6 +7,8 @@
+ #include "Common.h"
+ #include "R3000A.h"
+ #include "Counters.h"
++#include "GS/VR/VRSession.h"
++#include "GS/VR/VRStereo.h"
+ #include "IopCounters.h"
+ 
+ #include "GS.h"
+@@ -506,6 +508,10 @@ static __fi void VSyncStart(u32 sCycle)
+ 	// Memcard IO detection - Uses a tick system to determine when memcards are no longer being written.
+ 	MemcardBusy::Decrement();
+ 
++	// VR fork: head pose into the game's camera slots before VBLANK wakes its main loop.
++	if (VRStereo::Enabled())
++		VRSession::OnEEVsync(); // does nothing without a headset session, unless [VR] FakeHead
++
+ 	if (!GSSMODE1reg.SINT)
+ 	{
+ 		hwIntcIrq(INTC_VBLANK_S);
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index 3e8aec9..888afa1 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -20,6 +20,7 @@
+ #include "GS/Renderers/Null/GSRendererNull.h"
+ #include "GS/Renderers/HW/GSRendererHW.h"
+ #include "GS/Renderers/HW/GSTextureReplacements.h"
++#include "GS/VR/VRSession.h"
+ #include "VMManager.h"
+ 
+ #ifdef ENABLE_OPENGL
+@@ -175,6 +176,7 @@ static void CloseGSDevice(bool clear_state)
+ 		return;
+ 
+ 	ImGuiManager::Shutdown(clear_state);
++	VRSession::OnDeviceClosing(); // VR fork: its textures go with the device
+ 	g_gs_device->Destroy();
+ 	g_gs_device.reset();
+ }
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 5281bad..1dcae9a 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -9,6 +9,8 @@
+ #include "GS/GSGL.h"
+ #include "GS/GSPerfMon.h"
+ #include "GS/GSUtil.h"
++#include "GS/VR/VRSession.h"
++#include "GS/VR/VRStereo.h"
+ #include "GSDumpReplayer.h"
+ #include "Host.h"
+ #include "PerformanceMetrics.h"
+@@ -19,6 +21,7 @@
+ #include "common/Image.h"
+ #include "common/Path.h"
+ #include "common/StringUtil.h"
++#include "common/Console.h"
+ #include "common/Timer.h"
+ 
+ #include "fmt/format.h"
+@@ -252,6 +255,9 @@ bool GSRenderer::Merge(int field)
+ 	if (GSConfig.FXAA)
+ 		g_gs_device->FXAA();
+ 
++	if (VRStereo::Enabled())
++		VRCompose();
++
+ 	// Sharpens biinear at lower resolutions, almost nearest but with more uniform pixels.
+ 	if (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp && (g_gs_device->GetWindowWidth() > fs.x || g_gs_device->GetWindowHeight() > fs.y))
+ 	{
+@@ -264,6 +270,69 @@ bool GSRenderer::Merge(int field)
+ 	return true;
+ }
+ 
++// VR fork: replace the merged output with eye L | eye R, both fetched from the
++// texture cache (see GS/VR/VRStereo.h for why the two display buffers are the eyes).
++void GSRenderer::VRCompose()
++{
++	const int idx = PCRTCDisplays.PCRTCDisplays[1].enabled ? 1 : 0;
++	const GSPCRTCRegs::PCRTCDisplay& disp = PCRTCDisplays.PCRTCDisplays[idx];
++	GSTexture* out = g_gs_device->GetCurrent();
++	if (!disp.enabled || disp.FBW == 0 || !out)
++		return;
++
++	u32 tbp[2];
++	const bool tracked = m_vr_tracker.Track(disp.Block(), tbp);
++	const bool openvr = VRStereo::GetSettings().mode == VRStereo::Mode::OpenVR;
++
++	// Menus, title, loading: no world view, so no stereo. Show the normal picture flat
++	// (headset: world-locked screen; desktop: left as it is).
++	if (!VRSession::WorldActive())
++	{
++		static constexpr float whole[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // the merge target is the picture's size
++		if (openvr)
++			VRSession::PresentFlat(out, whole);
++		return;
++	}
++
++	GSTexture* eyes[2];
++	float scale[2];
++	u32 pose[2];
++	if (!tracked || !GetVREyes(tbp, eyes, scale, pose))
++		return;
++
++	static u32 s_vs;
++	const bool dump = VRStereo::GetSettings().dump_eyes && (++s_vs % 450) == 0; // logs/vr_eye{0,1}.png every 5 s
++	const GSVector4 out_size = GSVector4(out->GetSize()).xyxy();
++	static GSVector4i s_last_rect = GSVector4i::zero();
++	if (!disp.framebufferRect.eq(s_last_rect))
++	{
++		s_last_rect = disp.framebufferRect;
++		Console.WriteLn("VR: eye crop source rect %d,%d-%d,%d, scale %.2f, texture %dx%d", s_last_rect.x, s_last_rect.y,
++			s_last_rect.z, s_last_rect.w, scale[0], eyes[0]->GetWidth(), eyes[0]->GetHeight());
++	}
++	float uv[2][4];
++	for (int eye = 0; eye < 2; eye++)
++	{
++		const GSVector4 src = (GSVector4(disp.framebufferRect) * GSVector4(scale[eye])) / GSVector4(eyes[eye]->GetSize()).xyxy();
++		GSVector4::store<false>(uv[eye], src);
++	}
++	if (openvr)
++		VRSession::Present(eyes, uv, pose);
++	else
++		VRSession::NotePair(pose);
++
++	// Desktop mirror: L | R
++	for (int eye = 0; eye < 2; eye++)
++	{
++		GSTexture* t = eyes[eye];
++		const GSVector4 src = GSVector4::load<false>(uv[eye]);
++		const GSVector4 dst = GSVector4(0.5f * eye, 0.0f, 0.5f * (eye + 1), 1.0f) * out_size;
++		g_gs_device->StretchRect(t, src, out, dst, ShaderConvert::COPY, true);
++		if (dump)
++			t->Save(Path::Combine(EmuFolders::Logs, fmt::format("vr_eye{}.png", eye)));
++	}
++}
++
+ GSVector2i GSRenderer::GetInternalResolution()
+ {
+ 	return m_real_size;
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index 1f8a310..da8abff 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include "GS/GSState.h"
++#include "GS/VR/VRStereo.h"
+ #include <memory>
+ #include <string>
+ 
+@@ -35,6 +36,12 @@ protected:
+ 	virtual GSTexture* GetOutput(int i, float& scale, int& y_offset) = 0;
+ 	virtual GSTexture* GetFeedbackOutput(float& scale) { return nullptr; }
+ 
++	// VR fork: the finished eye L / eye R frames held in the framebuffers at tbp[0] / tbp[1],
++	// and the head pose each was rendered with (VRSession::GSPoseTag when it was copied).
++	virtual bool GetVREyes(const u32 tbp[2], GSTexture* tex[2], float scale[2], u32 pose[2]) { return false; }
++	void VRCompose();
++	VRStereo::BufferTracker m_vr_tracker; // the two display buffers = the two eyes
++
+ public:
+ 	GSRenderer();
+ 	virtual ~GSRenderer();
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index ebf01b1..225b0fd 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #include "GS/Renderers/HW/GSRendererHW.h"
++#include "GS/VR/VRSession.h"
++#include "GS/VR/VRStereo.h"
+ #include "GS/Renderers/HW/GSTextureReplacements.h"
+ #include "GS/GSGL.h"
+ #include "GS/GSPerfMon.h"
+@@ -45,12 +47,17 @@ GSRendererHW::~GSRendererHW()
+ 
+ void GSRendererHW::Destroy()
+ {
++	VRReleaseSnapshots();
+ 	g_texture_cache->RemoveAll(true, true, true);
+ 	GSRenderer::Destroy();
+ }
+ 
+ void GSRendererHW::PurgeTextureCache(bool sources, bool targets, bool hash_cache)
+ {
++	// VR fork: GSreopen purges like this before it recreates the device, which takes the
++	// snapshot textures with it.
++	if (targets)
++		VRReleaseSnapshots();
+ 	g_texture_cache->RemoveAll(sources, targets, hash_cache);
+ }
+ 
+@@ -81,6 +88,7 @@ void GSRendererHW::Reset(bool hardware_reset)
+ 		g_texture_cache->ReadbackAll();
+ 
+ 	g_texture_cache->RemoveAll(true, true, true);
++	VRReleaseSnapshots();
+ 
+ 	GSRenderer::Reset(hardware_reset);
+ }
+@@ -211,6 +219,85 @@ GSTexture* GSRendererHW::GetFeedbackOutput(float& scale)
+ 	return t;
+ }
+ 
++// Eye pairing. The GS runs one packet behind the EE, and every vsync it draws the two eye
++// frames into the two buffers in a fixed order. Snapshots are taken when a buffer is about
++// to be drawn over, so at vsync the buffer drawn second has a snapshot one pass newer than
++// the other: pair its PREVIOUS snapshot with the other's current one. Both then come from
++// the same EE vsync (same sim tick, same head pose).
++bool GSRendererHW::GetVREyes(const u32 tbp[2], GSTexture* tex[2], float scale[2], u32 pose[2])
++{
++	const VREyeSnap* s[2] = {FindVRSnap(tbp[0]), FindVRSnap(tbp[1])};
++	if (!s[0] || !s[1])
++		return false;
++	const int ahead = (s[0]->seq > s[1]->seq) ? 0 : 1;
++	for (int eye = 0; eye < 2; eye++)
++	{
++		const int which = (eye == ahead) ? (s[eye]->cur ^ 1) : s[eye]->cur;
++		tex[eye] = s[eye]->tex[which];
++		pose[eye] = s[eye]->pose[which];
++		scale[eye] = s[eye]->scale;
++		if (!tex[eye])
++			return false;
++	}
++	return true;
++}
++
++const GSRendererHW::VREyeSnap* GSRendererHW::FindVRSnap(u32 tbp) const
++{
++	for (const VREyeSnap& s : m_vr_snap)
++	{
++		if (s.tbp == tbp)
++			return &s;
++	}
++	return nullptr;
++}
++
++void GSRendererHW::VRSnapshot(u32 tbp)
++{
++	// Only an existing target that starts exactly here; never create one.
++	GSTextureCache::Target* rt = g_texture_cache->FindOverlappingTarget(tbp, tbp + 1);
++	if (!rt || rt->m_TEX0.TBP0 != tbp || !rt->m_texture)
++		return;
++
++	VREyeSnap* s = const_cast<VREyeSnap*>(FindVRSnap(tbp));
++	if (!s)
++	{
++		// Reuse the least recently written slot.
++		s = (m_vr_snap[0].seq <= m_vr_snap[1].seq) ? &m_vr_snap[0] : &m_vr_snap[1];
++		s->tbp = tbp;
++	}
++
++	GSTexture* src = rt->m_texture;
++	s->cur ^= 1;
++	GSTexture*& dst = s->tex[s->cur];
++	if (!dst || dst->GetSize() != src->GetSize() || dst->GetFormat() != src->GetFormat())
++	{
++		if (dst)
++			g_gs_device->Recycle(dst);
++		dst = g_gs_device->CreateRenderTarget(src->GetWidth(), src->GetHeight(), src->GetFormat(), false);
++		if (!dst)
++			return;
++	}
++	g_gs_device->CopyRect(src, dst, GSVector4i::loadh(src->GetSize()), 0, 0);
++	s->pose[s->cur] = VRSession::GSPoseTag();
++	s->scale = rt->m_scale;
++	s->seq = ++m_vr_snap_seq;
++}
++
++void GSRendererHW::VRReleaseSnapshots()
++{
++	for (VREyeSnap& s : m_vr_snap)
++	{
++		for (GSTexture* t : s.tex)
++		{
++			if (t)
++				g_gs_device->Recycle(t);
++		}
++		s = {};
++	}
++	m_vr_last_fbp = 0xFFFFFFFFu;
++}
++
+ void GSRendererHW::Lines2Sprites()
+ {
+ 	pxAssert(m_vt.m_primclass == GS_SPRITE_CLASS);
+@@ -2332,6 +2419,20 @@ void GSRendererHW::Draw()
+ 	m_cached_ctx.FRAME = context->FRAME;
+ 	m_cached_ctx.ZBUF = context->ZBUF;
+ 
++	// VR fork: the first draw into a different framebuffer starts a new frame there, so
++	// that buffer still holds its previous frame, now complete. Keep a copy for VRCompose.
++	// Only the two display buffers count: a draw into anything else (an off-screen effect)
++	// must neither snapshot nor end a frame.
++	if (VRStereo::Enabled())
++	{
++		const u32 fbp = context->FRAME.Block();
++		if (fbp != m_vr_last_fbp && m_vr_tracker.Knows(fbp))
++		{
++			m_vr_last_fbp = fbp;
++			VRSnapshot(fbp);
++		}
++	}
++
+ 	if (IsBadFrame())
+ 	{
+ 		GL_INS("HW: Warning skipping a draw call (%d)", s_n);
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.h b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+index ab02574..151c2ae 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.h
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+@@ -235,6 +235,27 @@ public:
+ 
+ 	GSTexture* GetOutput(int i, float& scale, int& y_offset) override;
+ 	GSTexture* GetFeedbackOutput(float& scale) override;
++	bool GetVREyes(const u32 tbp[2], GSTexture* tex[2], float scale[2], u32 pose[2]) override;
++
++private:
++	// VR fork: copies of each eye framebuffer, taken just before the GS starts drawing over it
++	struct VREyeSnap
++	{
++		u32 tbp = 0xFFFFFFFFu;
++		GSTexture* tex[2] = {}; // [cur], [cur ^ 1] = the snapshot before it
++		u32 pose[2] = {};       // VRSession::GSPoseTag of each copy = the pose it was rendered with
++		int cur = 0;
++		float scale = 1.0f;
++		u32 seq = 0;
++	};
++	VREyeSnap m_vr_snap[2];
++	u32 m_vr_snap_seq = 0;
++	u32 m_vr_last_fbp = 0xFFFFFFFFu;
++	const VREyeSnap* FindVRSnap(u32 tbp) const;
++	void VRSnapshot(u32 tbp);
++	void VRReleaseSnapshots();
++
++public:
+ 	void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) override;
+ 	void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) override;
+ 	void Move() override;
+diff --git a/pcsx2/GS/VR/VRSession.cpp b/pcsx2/GS/VR/VRSession.cpp
+new file mode 100644
+index 0000000..a2b0bc1
+--- /dev/null
++++ b/pcsx2/GS/VR/VRSession.cpp
+@@ -0,0 +1,668 @@
++// SPDX-FileCopyrightText: 2026 Police 911 VR fork
++// SPDX-License-Identifier: GPL-3.0+
++
++#include "GS/VR/VRSession.h"
++#include "GS/VR/VRStereo.h"
++#include "GS/Renderers/Common/GSDevice.h"
++#include "GS/Renderers/DX11/GSDevice11.h"
++#include "GS/Renderers/DX11/GSTexture11.h"
++#include "Memory.h"
++#include "MTGS.h"
++
++#include "common/Console.h"
++
++#include <openvr/openvr.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstring>
++#include <mutex>
++#include <string>
++
++#include <Windows.h>
++#include <TlHelp32.h>
++
++namespace
++{
++	// ---- game side (camera-tracking/re/ram/vrcam.py and vr90.py) ----
++	constexpr u32 VRCAM_SITE = 0x001B92A4; // jal glLoadIdentity -> jal CAVE (0x4F0000)
++	constexpr u32 VRCAM_JAL = 0x0C13C000;
++	constexpr u32 VR90_SITE = 0x001333A4; // jal renderScene -> jal RENDER_CAVE (0x4F0600)
++	constexpr u32 VR90_JAL = 0x0C13C180;
++	constexpr u32 SLOTS = 0x004F8000;
++	constexpr u32 S_HSCALE = 0x00; // double, glFrustum horizontal scale
++	constexpr u32 S_VSCALE = 0x08; // double, glFrustum vertical scale
++	constexpr u32 S_ROLL = 0x2C;   // float, negated
++	constexpr u32 S_PITCH = 0x30;
++	constexpr u32 S_YAW = 0x34;
++	constexpr u32 S_APPLIED = 0x38;  // u32, the cave bumps it once per rendered view (menus too)
++	constexpr u32 S_PLAY = 0x4C;     // u32, the play cave bumps it once per gameplay sim tick
++	constexpr u32 PLAY_CAVE = 0x004F0300;
++	constexpr u32 S_POSE_SEQ = 0x40;
++	constexpr u32 S_POSE_USED = 0x44; // u32, the cave copies POSE_SEQ here when it renders a view
++	constexpr u32 S_RECENTER = 0x48; // u32, anything nonzero: take the current head yaw as forward
++	constexpr u32 VR90 = SLOTS + 0x80;
++	constexpr u32 S_EYE_L = 0x1C; // float, eye x for pass 0, negated
++	constexpr u32 S_EYE_R = 0x20;
++	constexpr double STOCK_HSCALE = 0.30000001192092896;
++	constexpr double STOCK_VSCALE = 0.28200000524520874;
++
++	// ---- settings ----
++	enum class Menus
++	{
++		World,  // flat screen standing in the room (default)
++		Head,   // flat screen fixed in front of the face
++		Stereo, // no flat screen: menus fill the view like gameplay
++	};
++
++	struct Config
++	{
++		float tan_h = 0.635f;     // stock frame half-extent, measured 2026-10-21 (yaw/pitch image shift)
++		float tan_v = 0.443f;
++		float fov_margin = 1.05f; // render a bit beyond the eye frusta
++		float units_per_m = 100.0f; // game units per metre (duck = 54.5 units)
++		int pose_delay = 2;        // vsyncs from writing a pose to presenting the frame it rendered
++		int stereo_after = 3;      // gameplay ticks before going stereo
++		int flat_after = 15;       // vsyncs without a gameplay tick before going to the flat screen
++		float flat_dist_m = 2.5f;  // flat screen: distance ahead, width, picture aspect
++		float flat_width_m = 2.4f;
++		float flat_aspect = 4.0f / 3.0f;
++		Menus menus = Menus::World;
++		bool fake_head = false;    // debug: without a headset, still tag poses (no rotation/FOV written)
++	};
++
++	Config LoadConfig()
++	{
++		Config c;
++		c.tan_h = Host::GetBaseFloatSettingValue("VR", "TanH", c.tan_h);
++		c.tan_v = Host::GetBaseFloatSettingValue("VR", "TanV", c.tan_v);
++		c.fov_margin = Host::GetBaseFloatSettingValue("VR", "FovMargin", c.fov_margin);
++		c.units_per_m = Host::GetBaseFloatSettingValue("VR", "UnitsPerMetre", c.units_per_m);
++		c.pose_delay = Host::GetBaseIntSettingValue("VR", "PoseDelay", c.pose_delay);
++		c.stereo_after = Host::GetBaseIntSettingValue("VR", "StereoAfter", c.stereo_after);
++		c.flat_after = Host::GetBaseIntSettingValue("VR", "FlatAfter", c.flat_after);
++		c.flat_dist_m = Host::GetBaseFloatSettingValue("VR", "FlatDistance", c.flat_dist_m);
++		c.flat_width_m = Host::GetBaseFloatSettingValue("VR", "FlatWidth", c.flat_width_m);
++		c.flat_aspect = Host::GetBaseFloatSettingValue("VR", "FlatAspect", c.flat_aspect);
++		const std::string menus = Host::GetBaseStringSettingValue("VR", "Menus", "world");
++		c.menus = menus == "head" ? Menus::Head : menus == "stereo" ? Menus::Stereo : Menus::World;
++		c.fake_head = Host::GetBaseBoolSettingValue("VR", "FakeHead", c.fake_head);
++		return c;
++	}
++
++	const Config& Cfg()
++	{
++		static const Config c = LoadConfig();
++		return c;
++	}
++
++	// ---- runtime-loaded openvr_api.dll ----
++	using PFN_Init = uint32_t (*)(vr::EVRInitError*, vr::EVRApplicationType, const char*);
++	using PFN_Shutdown = void (*)();
++	using PFN_GetInterface = void* (*)(const char*, vr::EVRInitError*);
++
++	struct Pose
++	{
++		vr::HmdMatrix34_t head; // seated universe, as returned by WaitGetPoses
++		float yaw = 0, pitch = 0, roll = 0; // degrees, relative to the recentred forward
++		u32 seq = 0;                        // the S_POSE_SEQ it was written with
++		bool valid = false;
++	};
++
++	struct Session
++	{
++		HMODULE dll = nullptr;
++		PFN_Shutdown shutdown = nullptr;
++		vr::IVRSystem* system = nullptr;
++		vr::IVRCompositor* compositor = nullptr; // GS thread: set last in Init
++		std::atomic<bool> ready{false};          // EE thread: the session and the eye geometry below are set
++		vr::IVROverlay* overlay = nullptr;
++		u32 attempts = 0; // Present calls since the last failed attach
++		bool loaded = false;
++
++		// flat screen (menus, title, anything drawn without vrcam): a world-locked overlay
++		vr::VROverlayHandle_t flat = vr::k_ulOverlayHandleInvalid;
++		GSTexture* flat_tex = nullptr; // the picture at flat_aspect, opaque
++		GSTexture* black = nullptr;    // submitted to both eyes behind the overlay
++		bool flat_shown = false;
++		u32 flat_placed = 0;           // the `recentres` value the overlay was placed at, 0 = not placed
++
++		// eye geometry, fixed per session
++		float eye_x[2] = {-0.032f, 0.032f}; // metres, head frame
++		float tan_h = 0, tan_v = 0;          // symmetric half-extents that cover both eyes
++		float raw[2][4] = {};                // GetProjectionRaw: left, right, top, bottom
++
++		// pose hand-off GS -> EE, and the history of what the EE was given
++		std::mutex mtx;
++		Pose latest;
++		float neutral_yaw = 0;
++		bool have_neutral = false;
++		u32 recentres = 1;            // bumped with every new neutral yaw
++		std::array<Pose, 16> written; // ring, indexed by seq
++		u32 vsync = 0;                // the last seq written (EE thread)
++
++		// GS thread: the S_POSE_USED the EE queued at the last vsync the GS has reached. The
++		// snapshots carry it; PickPose turns an eye pair's two tags into its pose.
++		u32 gs_tag = 0;
++
++		// GS thread: what Present did, logged every ~5 s
++		struct
++		{
++			u32 frames = 0, tagged = 0, fallback = 0, split = 0, flat = 0;
++			u32 last[2] = {}, last_ee = 0; // the last pair's tags and the EE seq then
++			u64 lag = 0; // sum over tagged frames of (EE seq at present - rendered seq)
++		} stats;
++	};
++
++	Session s;
++
++	bool ProcessRunning(const wchar_t* exe)
++	{
++		const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++		if (snap == INVALID_HANDLE_VALUE)
++			return false;
++		PROCESSENTRY32W e = {sizeof(e)};
++		bool found = false;
++		for (BOOL ok = Process32FirstW(snap, &e); ok && !found; ok = Process32NextW(snap, &e))
++			found = _wcsicmp(e.szExeFile, exe) == 0;
++		CloseHandle(snap);
++		return found;
++	}
++
++	bool Init()
++	{
++		if (s.compositor)
++			return true;
++		// Not attached: retry every ~5 s (Present runs once per vsync), so SteamVR may start late.
++		if (s.attempts++ % 450 != 0)
++			return false;
++		if (!s.loaded)
++		{
++			s.loaded = true;
++			s.dll = LoadLibraryW(L"openvr_api.dll");
++			if (!s.dll)
++				Console.Error("VR: openvr_api.dll not found next to the executable");
++		}
++		if (!s.dll)
++			return false;
++		const auto init = reinterpret_cast<PFN_Init>(GetProcAddress(s.dll, "VR_InitInternal2"));
++		const auto get = reinterpret_cast<PFN_GetInterface>(GetProcAddress(s.dll, "VR_GetGenericInterface"));
++		s.shutdown = reinterpret_cast<PFN_Shutdown>(GetProcAddress(s.dll, "VR_ShutdownInternal"));
++		if (!init || !get || !s.shutdown)
++		{
++			Console.Error("VR: openvr_api.dll is missing exports");
++			return false;
++		}
++
++		// VR_Init starts SteamVR by itself if it isn't running, and VR_IsHmdPresent is no
++		// guard (the Steam Frame driver reports a headset while not streaming). Only attach
++		// to a SteamVR that is already up; the launcher starts it.
++		if (!ProcessRunning(L"vrserver.exe"))
++		{
++			if (s.attempts == 1)
++				Console.Error("VR: SteamVR is not running; desktop mirror only until it starts");
++			return false;
++		}
++
++		vr::EVRInitError err = vr::VRInitError_None;
++		init(&err, vr::VRApplication_Scene, nullptr);
++		if (err != vr::VRInitError_None)
++		{
++			Console.Error("VR: VR_Init failed (%d). Is SteamVR running with a headset?", static_cast<int>(err));
++			return false;
++		}
++		s.system = static_cast<vr::IVRSystem*>(get(vr::IVRSystem_Version, &err));
++		vr::IVRCompositor* const comp = s.system ? static_cast<vr::IVRCompositor*>(get(vr::IVRCompositor_Version, &err)) : nullptr;
++		if (!comp)
++		{
++			Console.Error("VR: no IVRSystem/IVRCompositor (%d)", static_cast<int>(err));
++			s.shutdown();
++			s.system = nullptr;
++			return false;
++		}
++		comp->SetTrackingSpace(vr::TrackingUniverseSeated);
++		s.overlay = static_cast<vr::IVROverlay*>(get(vr::IVROverlay_Version, &err));
++		if (!s.overlay || s.overlay->CreateOverlay("pcsx2.vr.flat", "Police 24/7", &s.flat) != vr::VROverlayError_None)
++		{
++			Console.Error("VR: no flat-screen overlay; menus will show in the stereo view");
++			s.flat = vr::k_ulOverlayHandleInvalid;
++		}
++
++		s.tan_h = s.tan_v = 0.0f;
++		for (int eye = 0; eye < 2; eye++)
++		{
++			const vr::EVREye e = eye ? vr::Eye_Right : vr::Eye_Left;
++			float* r = s.raw[eye];
++			s.system->GetProjectionRaw(e, &r[0], &r[1], &r[2], &r[3]);
++			s.eye_x[eye] = s.system->GetEyeToHeadTransform(e).m[0][3];
++			s.tan_h = std::max({s.tan_h, std::fabs(r[0]), std::fabs(r[1])});
++			s.tan_v = std::max({s.tan_v, std::fabs(r[2]), std::fabs(r[3])});
++			Console.WriteLn("VR: eye %d projection raw left %.4f right %.4f top %.4f bottom %.4f, eye x %.4f m", eye,
++				r[0], r[1], r[2], r[3], s.eye_x[eye]);
++		}
++		s.tan_h *= Cfg().fov_margin;
++		s.tan_v *= Cfg().fov_margin;
++
++		u32 w = 0, h = 0;
++		s.system->GetRecommendedRenderTargetSize(&w, &h);
++		Console.WriteLn("VR: OpenVR up. Eye x %.4f / %.4f m, render tan %.3f x %.3f (%.1f x %.1f deg), recommended %ux%u",
++			s.eye_x[0], s.eye_x[1], s.tan_h, s.tan_v, 2 * std::atan(s.tan_h) * 57.29578f,
++			2 * std::atan(s.tan_v) * 57.29578f, w, h);
++
++		// Publish last: the EE thread (OnEEVsync) divides by tan_h once it sees ready.
++		s.compositor = comp;
++		s.ready.store(true, std::memory_order_release);
++		return true;
++	}
++
++	// The first few failures of each OpenVR call, so a headset test log says what broke.
++	void Check(int err, const char* what)
++	{
++		if (err == 0)
++			return;
++		static std::array<std::pair<const char*, u32>, 16> seen;
++		for (auto& [name, n] : seen)
++		{
++			if (name == what || !name)
++			{
++				name = what;
++				if (n++ < 3)
++					Console.Error("VR: %s failed (%d)%s", what, err, n == 3 ? ", not logging it again" : "");
++				return;
++			}
++		}
++	}
++
++	// R = Ry(yaw) * Rx(pitch) * Rz(roll), the inverse of the game's view order
++	// glRotatef(-roll, Z), (-pitch, X), (-yaw, Y). Signs match OpenVR (yaw + = left,
++	// pitch + = up, roll + = head tilted left), verified on screenshots 2026-10-21.
++	void ToEuler(const vr::HmdMatrix34_t& m, float* yaw, float* pitch, float* roll)
++	{
++		constexpr float deg = 57.29578f;
++		*pitch = std::asin(std::clamp(-m.m[1][2], -1.0f, 1.0f)) * deg;
++		*yaw = std::atan2(m.m[0][2], m.m[2][2]) * deg;
++		*roll = std::atan2(m.m[1][0], m.m[1][1]) * deg;
++	}
++
++	template <typename T>
++	void Poke(u32 addr, T v)
++	{
++		std::memcpy(&eeMem->Main[addr], &v, sizeof(T));
++	}
++
++	template <typename T>
++	T Peek(u32 addr)
++	{
++		T v;
++		std::memcpy(&v, &eeMem->Main[addr], sizeof(T));
++		return v;
++	}
++
++	bool Ready()
++	{
++		if (!Init())
++			return false;
++		if (g_gs_device->GetRenderAPI() != RenderAPI::D3D11)
++		{
++			static bool warned;
++			if (!warned)
++				Console.Error("VR: OpenVR output needs the Direct3D 11 renderer (Renderer = 3)");
++			warned = true;
++			return false;
++		}
++		return true;
++	}
++
++	// Blocks until the compositor wants the next frame: this paces the emulator to the HMD.
++	void WaitPoses()
++	{
++		vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
++		Check(s.compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0), "WaitGetPoses");
++		const vr::TrackedDevicePose_t& hmd = poses[vr::k_unTrackedDeviceIndex_Hmd];
++		if (hmd.bPoseIsValid)
++		{
++			std::lock_guard lk(s.mtx);
++			s.latest.head = hmd.mDeviceToAbsoluteTracking;
++			s.latest.valid = true;
++		}
++	}
++
++	void ShowFlat(bool show)
++	{
++		if (s.flat == vr::k_ulOverlayHandleInvalid || show == s.flat_shown)
++			return;
++		if (show)
++			Check(s.overlay->ShowOverlay(s.flat), "ShowOverlay");
++		else
++			Check(s.overlay->HideOverlay(s.flat), "HideOverlay");
++		s.flat_shown = show;
++	}
++
++	// Menus = world: stand the screen flat_dist_m ahead of the head, square to the game's
++	// forward (the recentred yaw; the head's own yaw before the first recentre), level, at
++	// head height. It stays there until the next recentre.
++	// Menus = head: flat_dist_m straight ahead of the face, moving with it.
++	void PlaceFlat()
++	{
++		if (Cfg().menus == Menus::Head)
++		{
++			if (s.flat_placed)
++				return;
++			s.flat_placed = 1;
++			const vr::HmdMatrix34_t m = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, -Cfg().flat_dist_m}}};
++			Check(s.overlay->SetOverlayWidthInMeters(s.flat, Cfg().flat_width_m), "SetOverlayWidthInMeters");
++			Check(s.overlay->SetOverlayTransformTrackedDeviceRelative(s.flat, vr::k_unTrackedDeviceIndex_Hmd, &m),
++				"SetOverlayTransformTrackedDeviceRelative");
++			return;
++		}
++
++		Pose p;
++		float yaw;
++		{
++			std::lock_guard lk(s.mtx);
++			p = s.latest;
++			if (s.flat_placed == s.recentres || !p.valid)
++				return;
++			s.flat_placed = s.recentres;
++			float pitch, roll;
++			ToEuler(p.head, &yaw, &pitch, &roll);
++			if (s.have_neutral)
++				yaw = s.neutral_yaw;
++		}
++		const float r = yaw / 57.29578f, c = std::cos(r), sn = std::sin(r);
++		const float d = Cfg().flat_dist_m;
++		vr::HmdMatrix34_t m = {{
++			{c, 0, sn, p.head.m[0][3] - sn * d},
++			{0, 1, 0, p.head.m[1][3]},
++			{-sn, 0, c, p.head.m[2][3] - c * d},
++		}};
++		Check(s.overlay->SetOverlayWidthInMeters(s.flat, Cfg().flat_width_m), "SetOverlayWidthInMeters");
++		Check(s.overlay->SetOverlayTransformAbsolute(s.flat, vr::TrackingUniverseSeated, &m), "SetOverlayTransformAbsolute");
++	}
++
++	void SubmitEyes(GSTexture* const tex[2], const vr::VRTextureBounds_t b[2], const Pose& rendered)
++	{
++		for (int eye = 0; eye < 2; eye++)
++		{
++			vr::VRTextureWithPose_t t = {};
++			t.handle = static_cast<ID3D11Texture2D*>(*static_cast<GSTexture11*>(tex[eye]));
++			t.eType = vr::TextureType_DirectX;
++			t.eColorSpace = vr::ColorSpace_Gamma;
++			if (rendered.valid)
++				t.mDeviceToAbsoluteTracking = rendered.head;
++			Check(s.compositor->Submit(eye ? vr::Eye_Right : vr::Eye_Left, &t, &b[eye],
++					  rendered.valid ? vr::Submit_TextureWithPose : vr::Submit_Default),
++				eye ? "Submit (right eye)" : "Submit (left eye)");
++		}
++		s.compositor->PostPresentHandoff();
++	}
++	// Every ~5 s: how the eye pairs were posed. lag = vsyncs between writing a pose and
++	// presenting the frame rendered with it (what PoseDelay used to guess).
++	void LogStats()
++	{
++		auto& st = s.stats;
++		if (st.frames + st.flat < 450)
++			return;
++		Console.WriteLn("VR: 5 s: %u pairs (%u pose-tagged, lag %.2f vsyncs; %u fixed-delay; %u eyes >1 tag apart), %u flat."
++						" Last pair tags %u/%u at EE seq %u", st.frames, st.tagged,
++			st.tagged ? static_cast<double>(st.lag) / st.tagged : 0.0, st.fallback, st.split, st.flat, st.last[0], st.last[1],
++			st.last_ee);
++		st = {};
++	}
++
++	// The pose an eye pair was rendered with, from the tags its snapshots carry. The GS runs
++	// one packet behind the EE, so pass R's draws reach the ring after the next vsync's tag:
++	// the eye drawn second reads one too high, and the lower tag is the pair's pose (verified
++	// on the desktop 2026-10-22: always N / N+1). Without a usable tag (vrcam re-installed,
++	// eyes further apart, older than the ring), fall back to a fixed delay behind the EE.
++	Pose PickPose(const u32 pose[2])
++	{
++		Pose rendered;
++		{
++			std::lock_guard lk(s.mtx);
++			const u32 seq = std::min(pose[0], pose[1]);
++			const Pose& tagged = s.written[seq % s.written.size()];
++			s.stats.frames++;
++			s.stats.last[0] = pose[0];
++			s.stats.last[1] = pose[1];
++			s.stats.last_ee = s.vsync;
++			const bool paired = std::max(pose[0], pose[1]) - seq <= 1;
++			if (!paired)
++				s.stats.split++;
++			if (seq && paired && tagged.valid && tagged.seq == seq)
++			{
++				rendered = tagged;
++				s.stats.tagged++;
++				s.stats.lag += s.vsync - seq;
++			}
++			else
++			{
++				const int delay = std::clamp(Cfg().pose_delay, 0, static_cast<int>(s.written.size()) - 1);
++				rendered = s.written[(s.vsync - delay) % s.written.size()];
++				s.stats.fallback++;
++			}
++		}
++		LogStats();
++		return rendered;
++	}
++} // namespace
++
++bool VRSession::WorldActive()
++{
++	static u32 s_last, s_run, s_stall;
++	static bool s_world;
++
++	// S_PLAY only moves while the player is in a stage. An older vrcam without the play
++	// cave only has S_APPLIED, which also moves in menus.
++	if (Cfg().menus == Menus::Stereo)
++		return true;
++	const bool installed = eeMem && Peek<u32>(VRCAM_SITE) == VRCAM_JAL;
++	const u32 counter = !installed ? s_last : Peek<u32>(SLOTS + (Peek<u32>(PLAY_CAVE) ? S_PLAY : S_APPLIED));
++	// Ticks come at 50 or 25 Hz against a 90 Hz vsync, so vsyncs without a tick are
++	// normal: s_run counts ticks, and only a stall of flat_after vsyncs resets it.
++	if (counter != s_last)
++	{
++		s_last = counter;
++		s_run++;
++		s_stall = 0;
++	}
++	else if (++s_stall >= static_cast<u32>(Cfg().flat_after))
++	{
++		s_run = 0;
++	}
++
++	const bool was = s_world;
++	if (!installed)
++		s_world = false;
++	else if (!s_world && s_run >= static_cast<u32>(Cfg().stereo_after))
++		s_world = true;
++	else if (s_world && s_stall >= static_cast<u32>(Cfg().flat_after))
++		s_world = false;
++	if (s_world != was)
++		Console.WriteLn(s_world ? "VR: gameplay, stereo" : "VR: no gameplay, flat screen");
++	return s_world;
++}
++
++bool VRSession::Present(GSTexture* const tex[2], const float uv[2][4], const u32 pose[2])
++{
++	if (!Ready())
++		return false;
++	WaitPoses();
++	ShowFlat(false);
++
++	const Pose rendered = PickPose(pose);
++
++	// The game renders a symmetric frustum of +-tan_h x +-tan_v over the frame; crop out
++	// each eye's asymmetric one. GetProjectionRaw's "top" and "bottom" are the y-up
++	// tangents of the LOWER and UPPER edges (GetProjectionMatrix puts NDC +1 at
++	// "bottom"): on the Steam Frame the eye sees 1.17 up and 1.73 down. Texture row 0 is
++	// the picture's top, so vMin comes from "bottom". Reading them the other way round
++	// shifted the view ~0.56 tan down (user, 2026-10-29: wide looking up, narrow looking down).
++	vr::VRTextureBounds_t b[2];
++	for (int eye = 0; eye < 2; eye++)
++	{
++		const float* r = s.raw[eye];
++		const float u0 = uv[eye][0], v0 = uv[eye][1], du = uv[eye][2] - u0, dv = uv[eye][3] - v0;
++		b[eye].uMin = u0 + du * (r[0] + s.tan_h) / (2 * s.tan_h);
++		b[eye].uMax = u0 + du * (r[1] + s.tan_h) / (2 * s.tan_h);
++		b[eye].vMin = v0 + dv * (s.tan_v - r[3]) / (2 * s.tan_v);
++		b[eye].vMax = v0 + dv * (s.tan_v - r[2]) / (2 * s.tan_v);
++	}
++	SubmitEyes(tex, b, rendered);
++	return true;
++}
++
++void VRSession::NotePair(const u32 pose[2])
++{
++	PickPose(pose);
++}
++
++bool VRSession::PresentFlat(GSTexture* frame, const float uv[4])
++{
++	if (!Ready())
++		return false;
++	if (s.flat == vr::k_ulOverlayHandleInvalid)
++		return false; // no overlay: the caller keeps showing the eyes
++	WaitPoses();
++
++	// Copy into our own opaque texture at the picture's aspect (the GS output's alpha is
++	// not meant for display, and its size follows the window).
++	GSDevice11* const dev = static_cast<GSDevice11*>(g_gs_device.get());
++	const GSVector4 src = GSVector4::load<false>(uv);
++	const int h = std::max(1, static_cast<int>((src.w - src.y) * frame->GetHeight()));
++	const int w = std::max(1, static_cast<int>(h * Cfg().flat_aspect));
++	if (!s.flat_tex || s.flat_tex->GetWidth() != w || s.flat_tex->GetHeight() != h)
++	{
++		if (s.flat_tex)
++			g_gs_device->Recycle(s.flat_tex);
++		s.flat_tex = g_gs_device->CreateRenderTarget(w, h, GSTexture::Format::Color, false, false);
++	}
++	if (!s.black && (s.black = g_gs_device->CreateRenderTarget(16, 16, GSTexture::Format::Color, false, false)))
++	{
++		dev->ClearRenderTarget(s.black, 0xFF000000u);
++		dev->CommitClear(s.black); // clears are lazy, and nothing else ever draws to it
++	}
++	if (!s.flat_tex || !s.black)
++		return false;
++	// Opaque black, then the picture's RGB only.
++	dev->ClearRenderTarget(s.flat_tex, 0xFF000000u);
++	dev->CommitClear(s.flat_tex);
++	dev->StretchRect(frame, src, s.flat_tex, GSVector4(0, 0, w, h), true, true, true, false);
++
++	PlaceFlat();
++	vr::Texture_t t = {static_cast<ID3D11Texture2D*>(*static_cast<GSTexture11*>(s.flat_tex)), vr::TextureType_DirectX,
++		vr::ColorSpace_Gamma};
++	Check(s.overlay->SetOverlayTexture(s.flat, &t), "SetOverlayTexture");
++	ShowFlat(true);
++
++	GSTexture* const eyes[2] = {s.black, s.black};
++	const vr::VRTextureBounds_t b[2] = {{0, 0, 1, 1}, {0, 0, 1, 1}};
++	SubmitEyes(eyes, b, Pose{});
++	s.stats.flat++;
++	return true;
++}
++
++u32 VRSession::GSPoseTag()
++{
++	return s.gs_tag;
++}
++
++void VRSession::OnDeviceClosing()
++{
++	// The overlay may still show the old texture; take it down with the device.
++	if (s.overlay && s.flat != vr::k_ulOverlayHandleInvalid)
++	{
++		Check(s.overlay->ClearOverlayTexture(s.flat), "ClearOverlayTexture");
++		ShowFlat(false);
++		s.flat_placed = 0;
++	}
++	if (g_gs_device)
++	{
++		if (s.flat_tex)
++			g_gs_device->Recycle(s.flat_tex);
++		if (s.black)
++			g_gs_device->Recycle(s.black);
++	}
++	s.flat_tex = s.black = nullptr;
++}
++
++void VRSession::OnEEVsync()
++{
++	const bool ready = s.ready.load(std::memory_order_acquire);
++	if ((!ready && !Cfg().fake_head) || !eeMem)
++		return;
++	if (Peek<u32>(VRCAM_SITE) != VRCAM_JAL)
++		return; // vrcam not installed (menus before boot, another game, or turned off)
++
++	// Tag the GS stream: everything the game kicked before this vsync was rendered with
++	// pose S_POSE_USED, and this command lands in the ring right behind it.
++	const u32 used = Peek<u32>(SLOTS + S_POSE_USED);
++	MTGS::RunOnGSThread([used]() { s.gs_tag = used; });
++
++	std::lock_guard lk(s.mtx);
++	if (!ready)
++	{
++		// FakeHead: a neutral pose, sequenced and tagged like a real one, nothing else written.
++		Pose p;
++		p.valid = true;
++		p.seq = ++s.vsync;
++		Poke<u32>(SLOTS + S_POSE_SEQ, p.seq);
++		s.written[p.seq % s.written.size()] = p;
++		return;
++	}
++	Pose p = s.latest;
++	if (!p.valid)
++		return;
++
++	float yaw, pitch, roll;
++	ToEuler(p.head, &yaw, &pitch, &roll);
++	if (!s.have_neutral || Peek<u32>(SLOTS + S_RECENTER))
++	{
++		s.neutral_yaw = yaw;
++		s.have_neutral = true;
++		s.recentres++;
++		Poke<u32>(SLOTS + S_RECENTER, 0);
++	}
++	yaw -= s.neutral_yaw;
++	if (yaw > 180.0f)
++		yaw -= 360.0f;
++	if (yaw < -180.0f)
++		yaw += 360.0f;
++	p.yaw = yaw;
++	p.pitch = pitch;
++	p.roll = roll;
++
++	Poke<float>(SLOTS + S_YAW, -yaw);
++	Poke<float>(SLOTS + S_PITCH, -pitch);
++	Poke<float>(SLOTS + S_ROLL, -roll);
++	Poke<double>(SLOTS + S_HSCALE, STOCK_HSCALE * Cfg().tan_h / s.tan_h);
++	Poke<double>(SLOTS + S_VSCALE, STOCK_VSCALE * Cfg().tan_v / s.tan_v);
++	if (Peek<u32>(VR90_SITE) == VR90_JAL)
++	{
++		Poke<float>(VR90 + S_EYE_L, -s.eye_x[0] * Cfg().units_per_m);
++		Poke<float>(VR90 + S_EYE_R, -s.eye_x[1] * Cfg().units_per_m);
++	}
++	p.seq = ++s.vsync;
++	Poke<u32>(SLOTS + S_POSE_SEQ, p.seq);
++	s.written[p.seq % s.written.size()] = p;
++}
++
++void VRSession::Shutdown()
++{
++	s.ready.store(false, std::memory_order_release);
++	if (s.overlay && s.flat != vr::k_ulOverlayHandleInvalid)
++		s.overlay->DestroyOverlay(s.flat);
++	s.flat = vr::k_ulOverlayHandleInvalid;
++	s.overlay = nullptr;
++	s.flat_shown = false;
++	s.flat_placed = 0;
++	// The textures belong to the GS device, which frees them when it goes away.
++	s.flat_tex = s.black = nullptr;
++	if (s.shutdown && s.compositor)
++		s.shutdown();
++	s.compositor = nullptr;
++	s.system = nullptr;
++	s.attempts = 0;
++}
+diff --git a/pcsx2/GS/VR/VRSession.h b/pcsx2/GS/VR/VRSession.h
+new file mode 100644
+index 0000000..bcced26
+--- /dev/null
++++ b/pcsx2/GS/VR/VRSession.h
+@@ -0,0 +1,56 @@
++// SPDX-FileCopyrightText: 2026 Police 911 VR fork
++// SPDX-License-Identifier: GPL-3.0+
++
++// OpenVR output for Police 24/7 VR (pcsx2-vr fork). [VR] Mode = openvr.
++//
++// GS thread (VRSession::Present, from GSRenderer::VRCompose): WaitGetPoses paces us to the
++// headset, then the finished eye pair is submitted with the head pose it was rendered from.
++//
++// Menus, the title, briefings and anything else outside a stage go to a flat screen instead
++// (VRSession::PresentFlat): a world-locked SteamVR overlay in front of the player, over
++// black eyes. VRSession::WorldActive decides, from vrcam's gameplay tick counter (S_PLAY).
++// [VR] Menus = world (the screen stands in the room) | head (fixed in front of the face) |
++// stereo (no flat screen; menus fill the view like gameplay).
++//
++// EE thread (VRSession::OnEEVsync, from Counters.cpp VSyncStart, before the VBLANK
++// interrupt wakes the game loop): the latest head rotation, per-eye offsets and the FOV
++// that covers both eye frusta are written into the game-side slots of
++// camera-tracking/re/ram/vrcam.py and vr90.py, but only while those patches are installed.
++
++#pragma once
++
++#include "common/Pcsx2Defs.h"
++
++class GSTexture;
++
++namespace VRSession
++{
++	// GS thread. tex = eye L/R frames, uv = the part of each texture that holds the frame
++	// (x0, y0, x1, y1, normalised). Returns false when there is no headset session.
++	// pose = the GSPoseTag each eye was snapshotted under (the pose it was rendered with).
++	bool Present(GSTexture* const tex[2], const float uv[2][4], const u32 pose[2]);
++
++	// GS thread. frame = the normal (mono) output, uv = the part that holds the picture.
++	// Returns false when there is no headset session or no overlay.
++	bool PresentFlat(GSTexture* frame, const float uv[4]);
++
++	// GS thread, once per vsync, also without a headset: true while the player is in a
++	// stage (vrcam's play counter advances), with hysteresis
++	// ([VR] StereoAfter ticks / FlatAfter vsyncs). False while vrcam isn't installed.
++	bool WorldActive();
++
++	// EE thread, once per vsync.
++	void OnEEVsync();
++
++	// GS thread, dryrun: account for an eye pair like Present does (the 5 s stats line).
++	void NotePair(const u32 pose[2]);
++
++	// GS thread: the pose seq the EE queued at the last vsync the GS has reached (OnEEVsync),
++	// so it is ordered with the draws. The snapshots record it.
++	u32 GSPoseTag();
++
++	// GS thread, before the GS device is destroyed: release textures that belong to it.
++	void OnDeviceClosing();
++
++	void Shutdown();
++} // namespace VRSession
+diff --git a/pcsx2/GS/VR/VRStereo.h b/pcsx2/GS/VR/VRStereo.h
+new file mode 100644
+index 0000000..660be85
+--- /dev/null
++++ b/pcsx2/GS/VR/VRStereo.h
+@@ -0,0 +1,95 @@
++// SPDX-FileCopyrightText: 2026 Police 911 VR fork
++// SPDX-License-Identifier: GPL-3.0+
++
++// Stereo pairs for Police 24/7 VR (pcsx2-vr fork).
++//
++// The game-side patch (camera-tracking/re/ram/vr90.py) runs the game's main loop twice
++// per vsync, eye L then eye R, so each eye is an ordinary game frame drawn into one of
++// the game's two double-buffered framebuffers. This file tracks which two buffers those
++// are; GSRendererHW snapshots them and GSRenderer::VRCompose shows them.
++//
++// Timing facts (verified 2026-10-21 with draw traces and texture dumps):
++// - The GS runs one packet behind the EE, so at vsync the buffer drawn second is one
++//   pass ahead of the other.
++// - A buffer is only complete when the GS starts drawing over it again. Read at vsync,
++//   the buffer drawn second is missing its late HUD text (TIME ELAPSED, CONTINUE...).
++// So GSRendererHW copies each buffer just before its first new draw, keeps two copies
++// per buffer, and pairs the eyes from the same EE vsync (GSRendererHW::GetVREyes).
++//
++// Settings ([VR] section of PCSX2.ini, read once):
++//   Mode     = off | dryrun | openvr   dryrun: L|R side by side in the normal window;
++//                                      openvr: also submit to SteamVR (VRSession.h)
++//   SwapEyes = false                   which buffer is the left eye
++//   DumpEyes = false                   debug: logs/vr_eye{0,1}.png every 5 s
++
++#pragma once
++
++#include "Host.h"
++
++#include <string>
++
++namespace VRStereo
++{
++	enum class Mode
++	{
++		Off,
++		DryRun,
++		OpenVR,
++	};
++
++	struct Settings
++	{
++		Mode mode = Mode::Off;
++		bool swap_eyes = false;
++		bool dump_eyes = false;
++	};
++
++	inline const Settings& GetSettings()
++	{
++		static const Settings s = [] {
++			Settings r;
++			const std::string m = Host::GetBaseStringSettingValue("VR", "Mode", "off");
++			if (m == "dryrun")
++				r.mode = Mode::DryRun;
++			else if (m == "openvr")
++				r.mode = Mode::OpenVR;
++			r.swap_eyes = Host::GetBaseBoolSettingValue("VR", "SwapEyes", false);
++			r.dump_eyes = Host::GetBaseBoolSettingValue("VR", "DumpEyes", false);
++			return r;
++		}();
++		return s;
++	}
++
++	inline bool Enabled() { return GetSettings().mode != Mode::Off; }
++
++	// The last two distinct display framebuffer block addresses.
++	class BufferTracker
++	{
++	public:
++		static constexpr u32 NONE = 0xFFFFFFFFu;
++
++		// Feed the displayed buffer every vsync. Returns true once two distinct buffers
++		// are known, with the eye L / eye R block addresses in tbp[0] / tbp[1].
++		bool Track(u32 display_tbp, u32 tbp[2])
++		{
++			if (display_tbp != m_last[0])
++			{
++				m_last[1] = m_last[0];
++				m_last[0] = display_tbp;
++			}
++			if (m_last[1] == NONE)
++				return false;
++			// Default: the displayed buffer is the right eye (pass R is the last one kicked).
++			const bool swap = GetSettings().swap_eyes;
++			tbp[0] = swap ? m_last[0] : m_last[1];
++			tbp[1] = swap ? m_last[1] : m_last[0];
++			return true;
++		}
++
++		// One of the last two display buffers (before two are known: the one seen so far).
++		bool Knows(u32 tbp) const { return tbp != NONE && (tbp == m_last[0] || tbp == m_last[1]); }
++
++	private:
++		u32 m_last[2] = {NONE, NONE};
++	};
++} // namespace VRStereo
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+index f8d251c..3b6363f 100644
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -9,6 +9,7 @@
+ #include "SaveState.h"
+ #include "PINE.h"
+ #include "VMManager.h"
++#include "vtlb.h"
+ #include "common/Error.h"
+ #include "common/Threading.h"
+ 
+@@ -347,7 +348,7 @@ bool PINEServer::Initialize(int slot)
+ 	}
+ 
+ 	// we allocate once buffers to not have to do mallocs for each IPC
+-	// request, as malloc is expansive when we optimize for µs.
++	// request, as malloc is expansive when we optimize for Âµs.
+ 	s_ret_buffer.resize(MAX_IPC_RETURN_SIZE);
+ 	s_ipc_buffer.resize(MAX_IPC_SIZE);
+ 
+@@ -508,6 +509,26 @@ void PINEServer::Deinitialize()
+ 		s_thread.join();
+ }
+ 
++// VR fork: a write over recompiled code (a protected RAM page) runs recClear, which races
++// the EE thread when done from this socket thread (crashes 2026-10-22 and 2026-10-29, both
++// in recClear while patches were reinstalled after a savestate load). Such writes run on
++// the CPU thread instead, which pumps its queue at every vsync (PollInputOnCPUThread), and
++// this thread waits so a read-back sees them. Data writes stay direct and cheap.
++template <typename T>
++static void PineWrite(u32 a, T v)
++{
++	const vtlb_ProtectionMode m = mmap_GetRamPageInfo(a);
++	if (m != ProtMode_Write && m != ProtMode_Manual)
++	{
++		vtlb_memWrite<T>(a, v);
++		return;
++	}
++	Host::RunOnCPUThread([a, v] {
++		if (VMManager::HasValidVM())
++			vtlb_memWrite<T>(a, v);
++	}, true);
++}
++
+ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8>& ret_buffer, u32 buf_size)
+ {
+ 	u32 ret_cnt = 5;
+@@ -590,7 +611,7 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				if (!SafetyChecks(buf_cnt, 1 + 4, ret_cnt, 0, buf_size)) [[unlikely]]
+ 					goto error;
+ 				const u32 a = FromSpan<u32>(buf, buf_cnt);
+-				memWrite8(a, FromSpan<u8>(buf, buf_cnt + 4));
++				PineWrite<u8>(a, FromSpan<u8>(buf, buf_cnt + 4));
+ 				buf_cnt += 5;
+ 				break;
+ 			}
+@@ -601,7 +622,7 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				if (!SafetyChecks(buf_cnt, 2 + 4, ret_cnt, 0, buf_size)) [[unlikely]]
+ 					goto error;
+ 				const u32 a = FromSpan<u32>(buf, buf_cnt);
+-				memWrite16(a, FromSpan<u16>(buf, buf_cnt + 4));
++				PineWrite<u16>(a, FromSpan<u16>(buf, buf_cnt + 4));
+ 				buf_cnt += 6;
+ 				break;
+ 			}
+@@ -612,7 +633,7 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				if (!SafetyChecks(buf_cnt, 4 + 4, ret_cnt, 0, buf_size)) [[unlikely]]
+ 					goto error;
+ 				const u32 a = FromSpan<u32>(buf, buf_cnt);
+-				memWrite32(a, FromSpan<u32>(buf, buf_cnt + 4));
++				PineWrite<u32>(a, FromSpan<u32>(buf, buf_cnt + 4));
+ 				buf_cnt += 8;
+ 				break;
+ 			}
+@@ -623,7 +644,7 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				if (!SafetyChecks(buf_cnt, 8 + 4, ret_cnt, 0, buf_size)) [[unlikely]]
+ 					goto error;
+ 				const u32 a = FromSpan<u32>(buf, buf_cnt);
+-				memWrite64(a, FromSpan<u64>(buf, buf_cnt + 4));
++				PineWrite<u64>(a, FromSpan<u64>(buf, buf_cnt + 4));
+ 				buf_cnt += 12;
+ 				break;
+ 			}
+diff --git a/pcsx2/pcsx2.vcxproj b/pcsx2/pcsx2.vcxproj
+index 1875a88..6175e83 100644
+--- a/pcsx2/pcsx2.vcxproj
++++ b/pcsx2/pcsx2.vcxproj
+@@ -358,6 +358,7 @@
+     <ClCompile Include="GS\Renderers\SW\GSRasterizer.cpp" />
+     <ClCompile Include="GS\Renderers\Common\GSRenderer.cpp" />
+     <ClCompile Include="GS\Renderers\HW\GSRendererHW.cpp" />
++    <ClCompile Include="GS\VR\VRSession.cpp" />
+     <ClCompile Include="GS\Renderers\HW\GSRendererHWMultiISA.cpp" />
+     <ClCompile Include="GS\Renderers\Null\GSRendererNull.cpp" />
+     <ClCompile Include="GS\Renderers\SW\GSRendererSW.cpp" />

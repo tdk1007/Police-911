@@ -1,0 +1,20 @@
+# Synthetic camera + the memory tooling in ../re/ram/.
+#
+#   py -3 -m pip install -r requirements.txt
+#
+# Lower bounds are the versions this was built and tested against on
+# Python 3.14 (C:\Python314). Nothing here needs a GPU.
+
+numpy>=2.0            # correlation scan in re/ram/hunt.py, frame maths
+opencv-python>=4.10   # drawing and the screenshot oracle in probe.py
+pyvirtualcam>=0.15    # pushes frames into the OBS Virtual Camera sink
+pygrabber>=0.2        # DirectShow device enumeration (vcam_check.py, capture_pose.py)
+mediapipe>=0.10       # pose estimation of the real standing player
+
+# Not listed because they are stdlib: socket/struct (PINE client), zipfile
+# (savestate extraction), json, argparse.
+#
+# NOTE ON pyvirtualcam: backend='obs' writes into the virtual-camera SINK that
+# the OBS installation registers. It does NOT need obs64.exe to be running --
+# and in fact OBS must NOT be running, because both processes want to own that
+# same sink. The launcher's -Motion synth mode enforces this.

@@ -1,0 +1,75 @@
+{
+  "default_bindings": [
+    {
+      "controller_type": "frame_controller",
+      "binding_url": "bindings_frame_controller.json"
+    }
+  ],
+  "actions": [
+    {
+      "name": "/actions/bridge/in/aim",
+      "type": "pose",
+      "requirement": "mandatory"
+    },
+    {
+      "name": "/actions/bridge/in/fire",
+      "type": "vector1",
+      "requirement": "mandatory"
+    },
+    {
+      "name": "/actions/bridge/in/recenter",
+      "type": "boolean",
+      "requirement": "suggested"
+    },
+    {
+      "name": "/actions/bridge/in/talk",
+      "type": "boolean",
+      "requirement": "suggested"
+    },
+    {
+      "name": "/actions/bridge/in/loadstate",
+      "type": "boolean",
+      "requirement": "optional"
+    },
+    {
+      "name": "/actions/bridge/in/savestate",
+      "type": "boolean",
+      "requirement": "optional"
+    },
+    {
+      "name": "/actions/bridge/in/slot_next",
+      "type": "boolean",
+      "requirement": "optional"
+    },
+    {
+      "name": "/actions/bridge/in/slot_prev",
+      "type": "boolean",
+      "requirement": "optional"
+    },
+    {
+      "name": "/actions/bridge/out/haptic",
+      "type": "vibration"
+    }
+  ],
+  "action_sets": [
+    {
+      "name": "/actions/bridge",
+      "usage": "leftright"
+    }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/bridge": "Police 24/7 bridge",
+      "/actions/bridge/in/fire": "Fire (trigger)",
+      "/actions/bridge/in/recenter": "Recenter (hold)",
+      "/actions/bridge/in/talk": "Claude voice push-to-talk",
+      "/actions/bridge/out/haptic": "Haptics",
+      "/actions/bridge/in/aim": "Gun aim (right hand)",
+      "/actions/bridge/in/loadstate": "Load the selected savestate",
+      "/actions/bridge/in/savestate": "Save to slot 1",
+      "/actions/bridge/in/slot_next": "Next savestate slot",
+      "/actions/bridge/in/slot_prev": "Previous savestate slot"
+    }
+  ]
+}

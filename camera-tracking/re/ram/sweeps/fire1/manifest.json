@@ -1,0 +1,101 @@
+{
+ "mode": "buttons",
+ "snapshots": [
+  {
+   "i": 0,
+   "path": "ram000.bin",
+   "held": true,
+   "phase": 0
+  },
+  {
+   "i": 1,
+   "path": "ram001.bin",
+   "held": true,
+   "phase": 0
+  },
+  {
+   "i": 2,
+   "path": "ram002.bin",
+   "held": false,
+   "phase": 1
+  },
+  {
+   "i": 3,
+   "path": "ram003.bin",
+   "held": false,
+   "phase": 1
+  },
+  {
+   "i": 4,
+   "path": "ram004.bin",
+   "held": true,
+   "phase": 2
+  },
+  {
+   "i": 5,
+   "path": "ram005.bin",
+   "held": true,
+   "phase": 2
+  },
+  {
+   "i": 6,
+   "path": "ram006.bin",
+   "held": false,
+   "phase": 3
+  },
+  {
+   "i": 7,
+   "path": "ram007.bin",
+   "held": false,
+   "phase": 3
+  },
+  {
+   "i": 8,
+   "path": "ram008.bin",
+   "held": true,
+   "phase": 4
+  },
+  {
+   "i": 9,
+   "path": "ram009.bin",
+   "held": true,
+   "phase": 4
+  },
+  {
+   "i": 10,
+   "path": "ram010.bin",
+   "held": false,
+   "phase": 5
+  },
+  {
+   "i": 11,
+   "path": "ram011.bin",
+   "held": false,
+   "phase": 5
+  },
+  {
+   "i": 12,
+   "path": "ram012.bin",
+   "held": true,
+   "phase": 6
+  },
+  {
+   "i": 13,
+   "path": "ram013.bin",
+   "held": true,
+   "phase": 6
+  },
+  {
+   "i": 14,
+   "path": "ram014.bin",
+   "held": false,
+   "phase": 7
+  },
+  {
+   "i": 15,
+   "path": "ram015.bin",
+   "held": false,
+   "phase": 7
+  }
+ ]
+}

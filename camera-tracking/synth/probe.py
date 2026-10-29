@@ -12,21 +12,93 @@ whose position varies.
 
     py probe.py watch [n]     # n shots during the current animation
 """
-import subprocess, sys, os, time
+import json, subprocess, sys, os, time
 import cv2, numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHOT = os.path.join(HERE, 'pcsx2_shot.png')
+SHOT_META = os.path.join(HERE, 'pcsx2_shot.json')
+ORACLE = os.path.join(HERE, 'oracle.json')
 
 
-def grab():
-    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", os.path.join(HERE, "shot.ps1")],
-                   capture_output=True)
+def grab(with_meta=False):
+    """Screenshot PCSX2's client area. Optionally also where on screen it was.
+
+    shot.ps1 captures the CLIENT rect, so pixel (0,0) is the top-left of the
+    rendered frame regardless of where the window sits or how thick its border
+    is. Everything downstream stores positions as fractions of this image, which
+    is why moving or resizing the window no longer invalidates a calibration.
+    """
+    # Delete first, and check the capture actually succeeded. Without this, a
+    # failed shot.ps1 left the PREVIOUS pcsx2_shot.png in place and cv2.imread
+    # happily returned it -- so a sweep could record the same stale dot position
+    # for every sample and look like a tracker with a dead band. Never read a
+    # screenshot we did not just take.
+    try:
+        os.remove(SHOT)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+    started = time.time()
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", os.path.join(HERE, "shot.ps1")],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stdout or r.stderr or '').strip() or f"exit {r.returncode}"
+        raise RuntimeError(f"screenshot failed: {msg}")
     img = cv2.imread(SHOT)
     if img is None:
-        raise RuntimeError("no screenshot")
-    return img
+        raise RuntimeError("no screenshot -- is PCSX2 running and not minimised?")
+    if os.path.getmtime(SHOT) < started - 1.0:
+        raise RuntimeError("screenshot is stale -- shot.ps1 did not rewrite it")
+    if not with_meta:
+        return img
+    meta = {}
+    try:
+        with open(SHOT_META, encoding='utf-8-sig') as f:
+            meta = json.load(f)
+    except Exception:
+        pass
+    meta.setdefault('width', img.shape[1])
+    meta.setdefault('height', img.shape[0])
+    return img, meta
+
+
+def to_frac(x, y, img=None, meta=None):
+    """Absolute pixel in the shot -> fraction of the client area."""
+    w = (meta or {}).get('width') or (img.shape[1] if img is not None else 1)
+    h = (meta or {}).get('height') or (img.shape[0] if img is not None else 1)
+    return x / float(w), y / float(h)
+
+
+def from_frac(fx, fy, img=None, meta=None):
+    """Fraction of the client area -> absolute pixel in the shot."""
+    w = (meta or {}).get('width') or (img.shape[1] if img is not None else 1)
+    h = (meta or {}).get('height') or (img.shape[0] if img is not None else 1)
+    return fx * float(w), fy * float(h)
+
+
+def load_oracle():
+    """Where the calibration ring and the preview panel are, as fractions.
+
+    Replaces the screen-absolute 4K pixel constants that used to be baked into
+    check_ring.py and measure.py, which silently became wrong the moment the
+    PCSX2 window moved.
+    """
+    try:
+        with open(ORACLE, encoding='utf-8-sig') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_oracle(d):
+    cur = load_oracle()
+    cur.update(d)
+    with open(ORACLE, 'w', encoding='utf-8') as f:
+        json.dump(cur, f, indent=1)
+    return cur
 
 
 def red_clusters(img, min_area=4, max_area=4000):
@@ -45,6 +117,41 @@ def red_clusters(img, min_area=4, max_area=4000):
                         "area": int(a), "w": int(w), "h": int(h),
                         "fill": round(float(fill), 2)})
     return out
+
+
+def tracker_dot(img, panel=None, min_area=8, max_area=400):
+    """The tracker's estimate: the small filled red square in the preview.
+
+    `panel` is (x0, x1, y0, y1) in image pixels, to exclude red UI elsewhere
+    (the title banner, the NOISE REMOVAL button).
+
+    Rejecting the calibration ring is the whole difficulty. The ring is a thin
+    hollow circle, and the obvious test -- "fill = area / bounding-box area is
+    high, so it is solid" -- FAILS on it: the threshold breaks the ring into
+    short arcs, and a 12x1 horizontal arc has fill = 1.00, higher than the
+    dot's own 0.90. That misidentification produced a dot_y of 299.0 (the ring's
+    own y) in the middle of a sweep and destroyed the fit, turning r = 0.997
+    into r = -0.16.
+
+    So also require the shape to be THICK in both axes and roughly square. An
+    arc is 1-2 px in one dimension; the dot is ~8x9.
+    """
+    best = None
+    for c in red_clusters(img, min_area=min_area, max_area=max_area):
+        if panel:
+            x0, x1, y0, y1 = panel
+            if not (x0 < c['x'] < x1 and y0 < c['y'] < y1):
+                continue
+        if c['w'] < 4 or c['h'] < 4:          # thin arc of the ring
+            continue
+        aspect = c['w'] / float(c['h'])
+        if not (0.4 <= aspect <= 2.5):        # elongated -> not the dot
+            continue
+        if c['fill'] < 0.6:                   # hollow -> the ring itself
+            continue
+        if best is None or c['area'] > best['area']:
+            best = c
+    return best
 
 
 def white_blob(img):
