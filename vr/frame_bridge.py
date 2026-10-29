@@ -602,6 +602,15 @@ def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
     # deadzone ~1.5 cm of real lean (the default 0.04 is 7.6 cm at the 1:1 scale)
     head = HeadWriter(p, deadzone=0.015 / IMM_LEAN_M)
     patches, slots = Patches(p), Savestates(p)
+    # PINE serves one client and this bridge holds it; other tools (Earpiece knobs) go
+    # through this relay port instead. Optional: the bridge plays fine without it.
+    from pine_relay import PineRelay, RELAY_PORT
+    try:
+        relay = PineRelay(p)
+        print(f'PINE relay for other tools on port {RELAY_PORT}', flush=True)
+    except OSError as e:
+        relay = None
+        print(f'PINE relay off: port {RELAY_PORT} is taken ({e})', flush=True)
     # Neutral = the first head pose, as in the fork (its yaw zero and flat-screen spot);
     # calib.json's Stage 1 stance would disagree with both until the first recentre.
     t0 = yaw0 = None
@@ -611,6 +620,8 @@ def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
     try:
         while True:
             patches.tick()
+            if relay:
+                relay.poll()
             poses = vr.poses()
             hmd = vr.hmd(poses)
             pose, st = vr.controller(poses, vr.right())
@@ -674,6 +685,8 @@ def run_immersive(vr, cal, verbose=False, ptt=None, aim_frame='render'):
             ptt.release()
         aim.release()
         head.neutral()
+        if relay:
+            relay.close()
         p.close()
 
 
