@@ -1,6 +1,7 @@
 Earpiece F-008: frame log and headless replay mode for the Police-911 PCSX2 fork.
 Applies on top of pcsx2-vr.patch. DRAFT: written without a build on 2026-11-02 (Todd's rig
-was not touched); the two new files are complete, the PINE.cpp / Counters.cpp / main hunks
+was not touched); the two new files are complete (round 2: no __int128, step waits for
+PCSX2's FrameAdvance pause), the PINE.cpp / Counters.cpp / main hunks
 show where the calls go and need their context lines checked against the tree when applied.
 Build and verify per earpiece RIG_CHECKLIST "F-008".
 
@@ -67,7 +68,7 @@ diff --git a/pcsx2/VR/Replay.cpp b/pcsx2/VR/Replay.cpp
 new file mode 100644
 --- /dev/null
 +++ b/pcsx2/VR/Replay.cpp
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,127 @@
 +// Earpiece F-008. See Replay.h.
 +#include "PrecompiledHeader.h"
 +
@@ -83,6 +84,7 @@ new file mode 100644
 +#include <future>
 +#include <mutex>
 +#include <string>
++#include <thread>
 +
 +namespace
 +{
@@ -108,8 +110,10 @@ new file mode 100644
 +		LARGE_INTEGER c, f;
 +		QueryPerformanceCounter(&c);
 +		QueryPerformanceFrequency(&f);
-+		// Same conversion as CPython's perf_counter_ns, so the rig can use the value as is.
-+		return static_cast<u64>((static_cast<__int128>(c.QuadPart) * 1000000000) / f.QuadPart);
++		// Same split as CPython's perf_counter_ns (_PyTime_MulDiv), so the rig can use the value
++		// as is; no __int128, which MSVC lacks.
++		const u64 q = static_cast<u64>(c.QuadPart), fr = static_cast<u64>(f.QuadPart);
++		return (q / fr) * 1000000000ull + (q % fr) * 1000000000ull / fr;
 +	}
 +} // namespace
 +
@@ -150,7 +154,6 @@ new file mode 100644
 +		{
 +			s_waiting->set_value(frame);
 +			s_waiting = nullptr;
-+			VMManager::SetPaused(true); // frame advance: stop again until the next step
 +		}
 +	}
 +}
@@ -180,8 +183,12 @@ new file mode 100644
 +		std::memcpy(s_held.data(), pad.data(), PAD_BYTES);
 +		s_waiting = &done;
 +	}
-+	VMManager::SetPaused(false);
++	// PCSX2's own frame advance runs one frame and pauses on the CPU thread; the reply waits
++	// for that pause too, so memory read after a step can't have moved on.
++	VMManager::FrameAdvance(1);
 +	*frame_after = got.get();
++	while (VMManager::GetState() != VMState::Paused)
++		std::this_thread::yield();
 +	return true;
 +}
 +
