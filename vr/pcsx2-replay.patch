@@ -1,0 +1,261 @@
+Earpiece F-008: frame log and headless replay mode for the Police-911 PCSX2 fork.
+Applies on top of pcsx2-vr.patch. DRAFT: written without a build on 2026-11-02 (Todd's rig
+was not touched); the two new files are complete, the PINE.cpp / Counters.cpp / main hunks
+show where the calls go and need their context lines checked against the tree when applied.
+Build and verify per earpiece RIG_CHECKLIST "F-008".
+
+What it adds (opcodes match earpiece-rig/src/earpiece_rig/pine.py):
+- 0x40 MsgFrameLog: every PCSX2 of the fork. Reply u32 n, then n x (u32 g_FrameCount,
+  u64 QueryPerformanceCounter in ns, the clock Python's perf_counter_ns reads), the vsyncs
+  since the last ask (ring of 1024, ~17 s at 60 Hz; the rig drains it 10x a second).
+  g_FrameCount is saved in savestates (rcntFreeze), so a replay loaded from a clip's
+  savestate counts on from the same frame the clip recorded.
+- 0x42 MsgFrameCount: u32 g_FrameCount now.
+- 0x41 MsgReplayStep: only with -earpiece-replay; FAIL otherwise, so Todd's game can never be
+  driven by it. Payload 132 bytes: head, left hand, right hand, each u32 buttons, f32 trigger,
+  f32 thumb x, f32 thumb y, f32 pos[3], f32 quat[4]. Holds that as the VR input for one frame,
+  runs exactly one frame (frame advance), replies u32 g_FrameCount.
+- -earpiece-replay <pine port> -earpiece-data <dir>: PINE on that port (never 28011), all
+  EmuFolders (settings, sstates, memcards, cache) under <dir>, memory cards disabled, Null GS
+  renderer and Null audio (no window to focus), VR camera on through the FakeHead path with the
+  pose taken from MsgReplayStep instead of OpenVR (no headset session), starts paused after
+  boot and only advances in MsgReplayStep.
+
+diff --git a/pcsx2/VR/Replay.h b/pcsx2/VR/Replay.h
+new file mode 100644
+--- /dev/null
++++ b/pcsx2/VR/Replay.h
+@@ -0,0 +1,38 @@
++// Earpiece F-008: frame log for every fork build, headless input replay for -earpiece-replay.
++#pragma once
++
++#include "common/Pcsx2Types.h"
++
++#include <span>
++#include <vector>
++
++namespace EarpieceReplay
++{
++	struct DeviceInput
++	{
++		u32 buttons;
++		float trigger, thumb_x, thumb_y;
++		float pos[3];
++		float quat[4];
++	};
++	static_assert(sizeof(DeviceInput) == 44);
++	constexpr u32 PAD_BYTES = 3 * sizeof(DeviceInput); // head, left hand, right hand
++
++	// Command line: -earpiece-replay <port> -earpiece-data <dir>. Parsed before VM start.
++	bool ParseArg(std::span<const char* const> args, size_t& i);
++	bool Enabled();
++	int PinePort();
++
++	// EE thread, VSyncStart: append (g_FrameCount, QPC ns) to the log.
++	void OnVsync(u32 frame);
++	// PINE thread: drain the log into `out` (u32 n, then n x {u32, u64}).
++	void DrainLog(std::vector<u8>& out);
++
++	// PINE thread: hold `pad` as the VR input, run one frame, return g_FrameCount after it.
++	// False if not a replay instance or no VM.
++	bool Step(std::span<const u8> pad, u32* frame_after);
++
++	// VR input path (VRSession), when Enabled(): the held replay input instead of OpenVR.
++	const DeviceInput* Held(int device);
++} // namespace EarpieceReplay
+diff --git a/pcsx2/VR/Replay.cpp b/pcsx2/VR/Replay.cpp
+new file mode 100644
+--- /dev/null
++++ b/pcsx2/VR/Replay.cpp
+@@ -0,0 +1,110 @@
++// Earpiece F-008. See Replay.h.
++#include "PrecompiledHeader.h"
++
++#include "VR/Replay.h"
++#include "Counters.h"
++#include "VMManager.h"
++
++#include <windows.h>
++
++#include <array>
++#include <atomic>
++#include <cstring>
++#include <future>
++#include <mutex>
++#include <string>
++
++namespace
++{
++	bool s_enabled = false;
++	int s_port = 0;
++	std::string s_data;
++
++	struct Entry
++	{
++		u32 frame;
++		u64 ns;
++	};
++	std::mutex s_log_lock;
++	std::array<Entry, 1024> s_log;
++	size_t s_head = 0, s_count = 0;
++
++	std::array<EarpieceReplay::DeviceInput, 3> s_held{};
++	std::promise<u32>* s_waiting = nullptr; // set by Step, completed by the next OnVsync
++	std::mutex s_step_lock;
++
++	u64 QpcNs()
++	{
++		LARGE_INTEGER c, f;
++		QueryPerformanceCounter(&c);
++		QueryPerformanceFrequency(&f);
++		// Same conversion as CPython's perf_counter_ns, so the rig can use the value as is.
++		return static_cast<u64>((static_cast<__int128>(c.QuadPart) * 1000000000) / f.QuadPart);
++	}
++} // namespace
++
++bool EarpieceReplay::ParseArg(std::span<const char* const> args, size_t& i)
++{
++	const std::string a = args[i];
++	if (a == "-earpiece-replay" && i + 1 < args.size())
++	{
++		s_port = std::atoi(args[++i]);
++		s_enabled = s_port > 0 && s_port != 28011 && s_port != 28012; // never Todd's ports
++		return true;
++	}
++	if (a == "-earpiece-data" && i + 1 < args.size())
++	{
++		s_data = args[++i];
++		return true;
++	}
++	return false;
++}
++
++bool EarpieceReplay::Enabled() { return s_enabled && !s_data.empty(); }
++int EarpieceReplay::PinePort() { return s_port; }
++
++void EarpieceReplay::OnVsync(u32 frame)
++{
++	{
++		std::lock_guard lk(s_log_lock);
++		s_log[(s_head + s_count) % s_log.size()] = {frame, QpcNs()};
++		if (s_count < s_log.size())
++			s_count++;
++		else
++			s_head = (s_head + 1) % s_log.size();
++	}
++	if (Enabled())
++	{
++		std::lock_guard lk(s_step_lock);
++		if (s_waiting)
++		{
++			s_waiting->set_value(frame);
++			s_waiting = nullptr;
++			VMManager::SetPaused(true); // frame advance: stop again until the next step
++		}
++	}
++}
++
++void EarpieceReplay::DrainLog(std::vector<u8>& out)
++{
++	std::lock_guard lk(s_log_lock);
++	const u32 n = static_cast<u32>(s_count);
++	out.insert(out.end(), reinterpret_cast<const u8*>(&n), reinterpret_cast<const u8*>(&n) + 4);
++	for (size_t k = 0; k < s_count; k++)
++	{
++		const Entry& e = s_log[(s_head + k) % s_log.size()];
++		out.insert(out.end(), reinterpret_cast<const u8*>(&e.frame), reinterpret_cast<const u8*>(&e.frame) + 4);
++		out.insert(out.end(), reinterpret_cast<const u8*>(&e.ns), reinterpret_cast<const u8*>(&e.ns) + 8);
++	}
++	s_head = s_count = 0;
++}
++
++bool EarpieceReplay::Step(std::span<const u8> pad, u32* frame_after)
++{
++	if (!Enabled() || pad.size() != PAD_BYTES || !VMManager::HasValidVM())
++		return false;
++	std::promise<u32> done;
++	auto got = done.get_future();
++	{
++		std::lock_guard lk(s_step_lock);
++		std::memcpy(s_held.data(), pad.data(), PAD_BYTES);
++		s_waiting = &done;
++	}
++	VMManager::SetPaused(false);
++	*frame_after = got.get();
++	return true;
++}
++
++const EarpieceReplay::DeviceInput* EarpieceReplay::Held(int device)
++{
++	return Enabled() && device >= 0 && device < 3 ? &s_held[device] : nullptr;
++}
+diff --git a/pcsx2/Counters.cpp b/pcsx2/Counters.cpp
+--- a/pcsx2/Counters.cpp
++++ b/pcsx2/Counters.cpp
+@@ -508,6 +508,9 @@ static __fi void VSyncStart(u32 sCycle)
+ 	// VR fork: head pose into the game's camera slots before VBLANK wakes its main loop.
+ 	if (VRStereo::Enabled())
+ 		VRSession::OnEEVsync(); // does nothing without a headset session, unless [VR] FakeHead
+
++	// Earpiece F-008: every frame's counter and time, for clip replay (VR/Replay.h).
++	EarpieceReplay::OnVsync(g_FrameCount);
++
+ 	if (!GSSMODE1reg.SINT)
+ 	{
+ 		hwIntcIrq(INTC_VBLANK_S);
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -1,3 +1,4 @@
++#include "VR/Replay.h"
+ // (existing includes)
+@@ ParseCommand, before `default: goto error;`
++			case 0x40: // Earpiece MsgFrameLog
++			{
++				std::vector<u8> log;
++				EarpieceReplay::DrainLog(log);
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, log.size(), buf_size)) [[unlikely]]
++					goto error;
++				std::memcpy(&ret_buffer[ret_cnt], log.data(), log.size());
++				ret_cnt += log.size();
++				break;
++			}
++			case 0x42: // Earpiece MsgFrameCount
++			{
++				if (!VMManager::HasValidVM() || !SafetyChecks(buf_cnt, 0, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++				ToResultVector(ret_buffer, g_FrameCount, ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
++			case 0x41: // Earpiece MsgReplayStep: replay instances only, FAIL on Todd's game
++			{
++				u32 frame = 0;
++				if (!SafetyChecks(buf_cnt, EarpieceReplay::PAD_BYTES, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++				if (!EarpieceReplay::Step(buf.subspan(buf_cnt, EarpieceReplay::PAD_BYTES), &frame))
++					goto error;
++				buf_cnt += EarpieceReplay::PAD_BYTES;
++				ToResultVector(ret_buffer, frame, ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
+@@ PINEServer::Initialize(int slot): use EarpieceReplay::PinePort() when Enabled()
++	if (EarpieceReplay::Enabled())
++		slot = EarpieceReplay::PinePort();
+@@ pcsx2-qt/QtHost.cpp ParseCommandLineOptions: before the unknown-argument error
++		if (EarpieceReplay::ParseArg(args, i))
++			continue;
+@@ pcsx2-qt/QtHost.cpp after settings load, when EarpieceReplay::Enabled():
++	// Own folders, no memory cards, no window, no audio, no OpenVR, PINE on our port.
++	EmuFolders::SetDataDirectory(s_data);          // settings, sstates, memcards, cache
++	si.SetBoolValue("MemoryCards", "Slot1_Enable", false);
++	si.SetBoolValue("MemoryCards", "Slot2_Enable", false);
++	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::Null));
++	si.SetStringValue("SPU2/Output", "Backend", "Null");
++	si.SetBoolValue("VR", "FakeHead", true); // VR on without OpenVR; the head comes from Held()
++	si.SetBoolValue("EmuCore", "EnablePINE", true);
++	// and VMManager::SetPaused(true) once the boot has reached the first vsync.
+@@ pcsx2/GS/VR/VRSession.cpp input read: when EarpieceReplay::Held(d) is set, use it
++	if (const auto* held = EarpieceReplay::Held(device))
++		return FromReplay(*held); // same struct the live OpenVR path fills
