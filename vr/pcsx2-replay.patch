@@ -26,6 +26,10 @@ What it adds (opcodes match earpiece-rig/src/earpiece_rig/pine.py):
   memory cards off, Null renderer, Null audio, no window (surfaceless), VR Mode dryrun (never
   loads openvr_api.dll), all input sources off, MTVU off (determinism), PINE on <port>,
   achievements off, starts paused.
+- F-011: in a replay instance the USB camera (Capture Eye / EyeToy) gets a device that never
+  has a picture instead of the host camera (usb-eyetoy-webcam.cpp, CRLF). The host camera's
+  frames arrive at host timing and outlive savestate loads, which made replays of one
+  savestate differ within a few frames. The game still sees its camera plugged in.
 
 diff --git a/pcsx2/Counters.cpp b/pcsx2/Counters.cpp
 index c798f99..65f81c4 100644
@@ -611,3 +615,46 @@ index d929153..4c612cf 100644
  	// check autoboot parameters, if we set something like fullscreen without a bios
  	// or disc, we don't want to actually start.
  	if (autoboot && !autoboot->source_type.has_value() && autoboot->filename.empty() && autoboot->elf_override.empty())
+diff --git a/pcsx2/USB/usb-eyetoy/usb-eyetoy-webcam.cpp b/pcsx2/USB/usb-eyetoy/usb-eyetoy-webcam.cpp
+index acbf04f..f47cb3d 100644
+--- a/pcsx2/USB/usb-eyetoy/usb-eyetoy-webcam.cpp
++++ b/pcsx2/USB/usb-eyetoy/usb-eyetoy-webcam.cpp
+@@ -11,11 +11,24 @@
+ #include "USB/usb-mic/usb-mic.h"
+ #include "USB/USB.h"
+ #include "StateWrapper.h"
++#include "GS/VR/Replay.h"
+ 
+ #include "common/Console.h"
+ 
+ namespace usb_eyetoy
+ {
++	// Earpiece replay: a camera that never has a picture (see CreateDevice). Holds no state,
++	// so every replay of a clip reads the same thing.
++	class NoPicture final : public VideoDevice
++	{
++	public:
++		int Open(int, int, FrameFormat, int) override { return 0; }
++		int Close() override { return 0; }
++		int GetImage(uint8_t*, size_t) override { return 0; }
++		void SetMirroring(bool) override {}
++		int Reset() override { return 0; }
++	};
++
+ 	typedef struct EYETOYState
+ 	{
+ 		USBDevice dev;
+@@ -423,7 +436,12 @@ namespace usb_eyetoy
+ 		if (!mic_proxy)
+ 			return nullptr;
+ 
+-		std::unique_ptr<VideoDevice> videodev(VideoDevice::CreateInstance());
++		// Earpiece replay instance: no host camera. Its frames arrive on DirectShow's thread at
++		// host timing, and the device keeps its last frame across savestate loads, so two
++		// replays of one clip read different pictures (F-011); and a replay must never open
++		// Todd's camera. The game still sees its camera plugged in; it just never gets a picture.
++		std::unique_ptr<VideoDevice> videodev(
++			EarpieceReplay::Enabled() ? std::make_unique<NoPicture>() : VideoDevice::CreateInstance());
+ 		if (!videodev)
+ 		{
+ 			Console.Error("Failed to create video device.");
