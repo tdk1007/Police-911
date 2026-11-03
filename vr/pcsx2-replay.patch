@@ -511,7 +511,7 @@ index 7b1e52a..8ba983f 100644
      <ClCompile Include="GS\Renderers\Null\GSRendererNull.cpp" />
      <ClCompile Include="GS\Renderers\SW\GSRendererSW.cpp" />
 diff --git a/pcsx2-qt/QtHost.cpp b/pcsx2-qt/QtHost.cpp
-index d929153..a7577e7 100644
+index d929153..4c612cf 100644
 --- a/pcsx2-qt/QtHost.cpp
 +++ b/pcsx2-qt/QtHost.cpp
 @@ -20,6 +20,7 @@
@@ -530,7 +530,20 @@ index d929153..a7577e7 100644
  {
  }
  
-@@ -1305,6 +1307,18 @@ bool QtHost::InitializeConfig()
+@@ -521,6 +523,12 @@ void EmuThread::setSurfaceless(bool surfaceless)
+ 		return;
+ 	}
+ 
++	// Earpiece replay: stay surfaceless. Host::OnVMResumed asks for the window back on every
++	// step; a window could show and take focus, and the headless GS device has no surface
++	// support (vkCreateWin32SurfaceKHR is null), which crashed the first step in F-010.
++	if (EarpieceReplay::Enabled() && !surfaceless)
++		return;
++
+ 	if (!MTGS::IsOpen() || m_is_surfaceless == surfaceless)
+ 		return;
+ 
+@@ -1305,6 +1313,18 @@ bool QtHost::InitializeConfig()
  		return false;
  	}
  
@@ -549,7 +562,7 @@ index d929153..a7577e7 100644
  	// Write crash dumps to the data directory, since that'll be accessible for certain.
  	CrashHandler::SetWriteDirectory(EmuFolders::DataRoot);
  
-@@ -1372,6 +1386,17 @@ bool QtHost::InitializeConfig()
+@@ -1372,6 +1392,17 @@ bool QtHost::InitializeConfig()
  		
  	}
  
@@ -567,7 +580,7 @@ index d929153..a7577e7 100644
  	// Setup wizard was incomplete last time?
  	s_run_setup_wizard =
  		s_run_setup_wizard || s_base_settings_interface->GetBoolValue("UI", "SetupWizardIncomplete", false);
-@@ -2164,6 +2189,16 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
+@@ -2164,6 +2195,16 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
  				AutoBoot(autoboot)->fast_boot = false;
  				continue;
  			}
@@ -584,7 +597,7 @@ index d929153..a7577e7 100644
  			else if (CHECK_ARG_PARAM(QStringLiteral("-state")))
  			{
  				AutoBoot(autoboot)->state_index = (++it)->toInt();
-@@ -2269,6 +2304,13 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
+@@ -2269,6 +2310,13 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
  		AutoBoot(autoboot)->filename += it->toStdString();
  	}
  
