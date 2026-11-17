@@ -61,7 +61,8 @@ Each message is independent (ignore earlier ones) and starts with REPORT: or ACT
 
 REPORT: the agent's final report. Say what a teammate would say out loud. Speak as the \
 agent, in first person ("I fixed...", "I didn't change anything"); "you" is the player. \
-Lead with the outcome. 1-3 short sentences unless the report asks the player a question or \
+Lead with the outcome; if the report answers a question (a list, a number, a finding), \
+say that information itself. 1-3 short sentences unless the report asks the player a question or \
 needs them to do something, then say that clearly.
 
 ACTIVITY: the agent's recent work log, mid-task. Say in ONE short sentence (under 15 \
@@ -70,7 +71,8 @@ words) what it is doing right now.
 Always output only the words to speak: no markdown, lists, code, file paths, line \
 numbers, hashes or URLs (say "the frame bridge" not "vr/frame_bridge.py"). Casual, \
 natural tone."""
-HAIKU_RECYCLE = 8         # restart the Haiku process after this many calls (bounds its context)
+HAIKU_TIMEOUT_S = 30      # no output this long -> kill Haiku and speak the fallback
+HAIKU_RECYCLE = 8       # restart the Haiku process after this many calls (bounds its context)
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 PREFIX = re.compile(r'^\s*(REPORT|ACTIVITY)\s*:\s*', re.I)   # Haiku sometimes echoes the tag
 SPEAKABLE_MAX = 240       # an Opus reply this short with no markup is spoken as-is (skips Haiku)
@@ -95,9 +97,13 @@ class Haiku:
         self.lock = threading.Lock()
         self.p, self.calls = None, 0
 
-    def _start(self):
+    def _kill(self):
         if self.p:
             self.p.kill()
+        self.p = None
+
+    def _start(self):
+        self._kill()
         self.p = subprocess.Popen(
             ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json',
              '--verbose', '--include-partial-messages', '--model', 'haiku', '--tools', '',
@@ -106,6 +112,15 @@ class Haiku:
             cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', bufsize=1)
         self.calls = 0
+        # stdout is drained on a thread so ask() can time out instead of hanging
+        self.lines = queue.Queue()
+        threading.Thread(target=self._pump, args=(self.p, self.lines), daemon=True).start()
+
+    @staticmethod
+    def _pump(p, q):
+        for line in p.stdout:
+            q.put(line)
+        q.put(None)
 
     def warm(self):
         with self.lock:
@@ -125,7 +140,10 @@ class Haiku:
                     'message': {'role': 'user', 'content': f'{kind}:\n{text}'}}) + '\n')
                 self.p.stdin.flush()
                 buf, out = '', []
-                for line in self.p.stdout:
+                while True:
+                    line = self.lines.get(timeout=HAIKU_TIMEOUT_S)
+                    if line is None:
+                        break
                     m = json.loads(line)
                     if m.get('type') == 'stream_event':
                         d = m['event'].get('delta', {})
@@ -144,9 +162,9 @@ class Haiku:
                             on_sentence and on_sentence(buf.strip())
                         return ' '.join(out) or None
                 raise OSError('haiku process exited')
-            except (OSError, ValueError) as e:
-                log('haiku', f'failed: {e}')
-                self.p = None
+            except (OSError, ValueError, queue.Empty) as e:
+                log('haiku', f'failed: {e!r}')
+                self._kill()
                 return None
 
 
@@ -161,6 +179,7 @@ class Speaker:
         self.q = queue.Queue()
         self.gen = 0                      # bumped by stop(); stale queue items are dropped
         self.last = ''
+        self._play_lock = threading.Lock()  # gen check + sd.play vs stop(): no sentence slips past a barge-in
         threading.Thread(target=self._run, daemon=True).start()
 
     def say(self, text, gen=None, remember=True):
@@ -173,8 +192,9 @@ class Speaker:
             self.q.put((gen, text))
 
     def stop(self):
-        self.gen += 1
-        sd.stop()
+        with self._play_lock:
+            self.gen += 1
+            sd.stop()
 
     def _run(self):
         while True:
@@ -190,10 +210,16 @@ class Speaker:
                 except Exception as e:
                     log('tts', f'failed: {e}')
                     continue
-                if gen != self.gen:
-                    break
-                sd.play(audio, sr, device=self.device)
-                sd.wait()
+                try:
+                    with self._play_lock:
+                        if gen != self.gen:
+                            break
+                        sd.play(audio, sr, device=self.device)
+                    sd.wait()
+                except sd.PortAudioError as e:
+                    # e.g. the headset's audio endpoint went away with SteamVR: re-enumerate
+                    log('tts', f'playback failed: {e}')
+                    sd._terminate(); sd._initialize()
             self.q.task_done()
 
 
@@ -203,9 +229,11 @@ class Opus:
 
     NAME = 'Claude Voice'     # display name in /resume and the desktop session list
 
-    def __init__(self, on_result, on_activity, model='opus', fresh=False, effort=None):
-        self.on_result, self.on_activity = on_result, on_activity
-        self.busy = False
+    def __init__(self, on_result, on_activity, on_exit, model='opus', fresh=False, effort=None):
+        self.on_result, self.on_activity, self.on_exit = on_result, on_activity, on_exit
+        self.pending = 0          # messages sent whose result hasn't come back (the CLI queues them)
+        self.closed = False       # set by close(): late output from this process is ignored
+        self.started = False      # got the init message, i.e. the session actually opened
         self.turn_start = 0.0
         cmd = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json',
                '--verbose', '--model', model, '--permission-mode', 'auto', '--name', self.NAME,
@@ -222,11 +250,18 @@ class Opus:
         threading.Thread(target=self._errors, daemon=True).start()
         log('opus', f'session {"resumed " + self.sid if self.sid else "started"}')
 
+    @property
+    def busy(self):
+        return self.pending > 0
+
     def close(self):
+        self.closed = True
         try:
+            if self.busy:
+                self.interrupt()
             self.p.stdin.close()
             self.p.wait(5)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, subprocess.TimeoutExpired):
             self.p.kill()
 
     def _write(self, obj):
@@ -234,10 +269,11 @@ class Opus:
         self.p.stdin.flush()
 
     def send(self, text):
-        if not self.busy:
-            self.busy, self.turn_start = True, time.time()
         self._write({'type': 'user', 'message': {'role': 'user', 'content': text},
                      'parent_tool_use_id': None})
+        if not self.busy:
+            self.turn_start = time.time()
+        self.pending += 1
 
     def interrupt(self):
         self._write({'type': 'control_request', 'request_id': uuid.uuid4().hex,
@@ -254,8 +290,11 @@ class Opus:
                 m = json.loads(line)
             except ValueError:
                 continue
+            if self.closed:
+                continue
             t = m.get('type')
             if t == 'system' and m.get('subtype') == 'init':
+                self.started = True
                 if m['session_id'] != self.sid:
                     self.sid = m['session_id']
                     log('opus', f'session id {self.sid}')
@@ -271,9 +310,13 @@ class Opus:
                         what = inp.get('description') or inp.get('file_path') or inp.get('pattern') or ''
                         self.on_activity(f'[{b["name"]}] {what}'[:200])
             elif t == 'result':
-                self.busy = False
-                self.on_result(m.get('result') or m.get('subtype', ''), m.get('is_error', False))
+                self.pending = max(0, self.pending - 1)
+                # off this thread: a slow Haiku must not stop Opus's stdout being drained
+                threading.Thread(target=self.on_result, daemon=True,
+                                 args=(m.get('result') or '', m.get('is_error', False))).start()
         log('opus', f'process exited ({self.p.wait()})')
+        if not self.closed:
+            self.on_exit(self)
 
 
 def saved_session():
@@ -335,7 +378,7 @@ class ClaudeVoice:
             raise AlreadyRunning('Claude voice is already running in another window')
         self.held = False
         self.mic_device = mic_device
-        self._chunks, self._stream = [], None
+        self._chunks, self._stream, self._mic_failed = [], None, 0.0
         self._activity, self._last_said = [], time.time()
         self._jobs = queue.Queue()
         log('voice', 'loading speech models...')
@@ -352,10 +395,23 @@ class ClaudeVoice:
         self.speaker.say(f"Claude's listening. {self._which()}")
 
     def _open(self, fresh):
-        o = Opus(self._on_result, self._on_activity, model=self.model, fresh=fresh,
-                 effort=self.effort)
+        o = Opus(self._on_result, self._on_activity, self._on_exit, model=self.model,
+                 fresh=fresh, effort=self.effort)
         set_title(o.sid)
         return o
+
+    def _on_exit(self, dead):
+        """The Opus process died on its own (crash, auth expiry, bad resume id): say so
+        and reopen -- resuming if it had started, fresh if it never got going."""
+        if dead is not self.opus:
+            return
+        if time.time() - getattr(self, '_last_reopen', 0) < 30:
+            self.speaker.say("Claude's session keeps stopping. Check the voice window "
+                             "when you're out of the headset.")
+            return
+        self._last_reopen = time.time()
+        self.speaker.say("Claude's session stopped. Reconnecting.")
+        self.opus = self._open(fresh=not dead.started)
 
     def _which(self):
         if not self.opus.resumed:
@@ -366,13 +422,21 @@ class ClaudeVoice:
     # --- push-to-talk (called from the bridge loop) ---
     def update(self, held):
         if held and not self.held:
-            self.held = True
+            if time.time() - self._mic_failed < 3:  # the bridge retries every frame; don't
+                return                              # spam the device or the warning
             self.speaker.stop()                     # barge-in
             self._chunks = []
-            self._stream = sd.InputStream(samplerate=MIC_SR, channels=1, dtype='float32',
-                                          device=self.mic_device,
-                                          callback=lambda d, *_: self._chunks.append(d.copy()))
-            self._stream.start()
+            try:
+                self._stream = sd.InputStream(samplerate=MIC_SR, channels=1, dtype='float32',
+                                              device=self.mic_device,
+                                              callback=lambda d, *_: self._chunks.append(d.copy()))
+                self._stream.start()
+            except sd.PortAudioError as e:      # never let a mic problem take down the bridge
+                log('voice', f'mic failed: {e}')
+                self._stream, self._mic_failed = None, time.time()
+                self.speaker.say("The mic didn't open.")
+                return
+            self.held = True
         elif not held and self.held:
             self.release()
 
@@ -380,7 +444,9 @@ class ClaudeVoice:
         if not self.held:
             return
         self.held = False
-        self._stream.stop(); self._stream.close()
+        if self._stream:
+            self._stream.stop(); self._stream.close()
+            self._stream = None
         audio = np.concatenate(self._chunks)[:, 0] if self._chunks else np.zeros(0, np.float32)
         if len(audio) >= MIN_SPEECH_S * MIC_SR:
             self._jobs.put(('audio', audio))
@@ -392,33 +458,40 @@ class ClaudeVoice:
     def _work(self):
         while True:
             kind, data = self._jobs.get()
-            text = data if kind == 'text' else self._transcribe(data)
-            if not text:
-                self.speaker.say("Sorry, didn't catch that.")
-                continue
-            log('you', text)
-            cmd = re.sub(r'[^a-z ]', '', text.lower()).strip()
-            if cmd in ('stop', 'cancel', 'stop stop', 'cancel that', 'abort'):
-                self.opus.interrupt()
-                self.speaker.say('Stopping.')
-            elif cmd in ('quiet', 'shut up', 'be quiet', 'shush', 'never mind', 'nevermind'):
-                self.speaker.stop()
-            elif cmd in ('repeat', 'say again', 'say that again', 'repeat that',
-                         'repeat that again', 'repeat again', 'say it again', 'what did you say'):
-                self.speaker.say(self.speaker.last)
-            elif cmd in ('new conversation', 'start a new conversation', 'new session',
-                         'start over', 'fresh start', 'start a new session'):
-                self.opus.close()
-                self.opus = self._open(fresh=True)
-                self.speaker.say('Okay, new conversation.')
-            elif cmd in ('which conversation', 'which session', 'what conversation is this',
-                         'what session is this', 'which conversation is this',
-                         'which session is this', 'where am i'):
-                self.speaker.say(self._which())
-            else:
-                self.speaker.say('Still working, queued that.' if self.opus.busy else 'On it.')
-                self._activity, self._last_said = [], time.time()
-                self.opus.send(text)
+            try:
+                self._handle(data if kind == 'text' else self._transcribe(data))
+            except Exception as e:              # keep the worker alive: a dead one = silence
+                log('voice', f'error: {e!r}')
+                self.speaker.say("Something went wrong sending that. Try again.")
+
+    def _handle(self, text):
+        if not text:
+            self.speaker.say("Sorry, didn't catch that.")
+            return
+        log('you', text)
+        cmd = re.sub(r'[^a-z ]', '', text.lower()).strip()
+        if cmd in ('stop', 'cancel', 'stop stop', 'cancel that', 'abort'):
+            self.opus.interrupt()
+            self.speaker.say('Stopping.')
+        elif cmd in ('quiet', 'shut up', 'be quiet', 'shush', 'never mind', 'nevermind'):
+            self.speaker.stop()
+        elif cmd in ('repeat', 'say again', 'say that again', 'repeat that',
+                     'repeat that again', 'repeat again', 'say it again', 'what did you say'):
+            self.speaker.say(self.speaker.last)
+        elif cmd in ('new conversation', 'start a new conversation', 'new session',
+                     'start over', 'fresh start', 'start a new session'):
+            self.opus.close()
+            self.opus = self._open(fresh=True)
+            self.speaker.say('Okay, new conversation.')
+        elif cmd in ('which conversation', 'which session', 'what conversation is this',
+                     'what session is this', 'which conversation is this',
+                     'which session is this', 'where am i'):
+            self.speaker.say(self._which())
+        else:
+            ack = 'Still working, queued that.' if self.opus.busy else 'On it.'
+            self.opus.send(text)                # first: if this fails, don't promise anything
+            self._activity, self._last_said = [], time.time()
+            self.speaker.say(ack)
 
     def _transcribe(self, audio):
         segs, _ = self.stt.transcribe(audio, language='en', beam_size=1, vad_filter=True,
@@ -440,8 +513,13 @@ class ClaudeVoice:
             spoken = self.haiku.ask('REPORT', text, lambda s: self.speaker.say(
                 s, gen=gen, remember=False)) if text else None
         if not spoken:
-            spoken = ('That run hit an error. The details are in the voice log.' if is_error
-                      else text[:400])
+            if is_error:
+                spoken = 'That run hit an error. The details are in the voice log.'
+            elif not text:
+                spoken = 'Done.'
+            else:                               # Haiku failed: first two sentences, markup stripped
+                plain = re.sub(r'[*`#>_]|https?://\S+|\S*[/\\]\S*', '', text)
+                spoken = ' '.join(SENTENCE_END.split(' '.join(plain.split()))[:2])
             self.speaker.say(spoken, gen=gen)
         self.speaker.last = spoken
         log('said', spoken)

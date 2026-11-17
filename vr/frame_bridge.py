@@ -719,6 +719,8 @@ def main():
                          f'connected first.')
     try:
         if args.voice_only:
+            if not ptt:
+                raise SystemExit('--voice-only needs voice (drop --no-voice)')
             return voice_only(vr, ptt)
         if args.immersive:
             cal = None
