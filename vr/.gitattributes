@@ -1,0 +1,3 @@
+# Patches hold the fork files byte for byte (PINE.cpp is CRLF, the VR files LF); line-ending
+# conversion would stop them applying. Earpiece F-010.
+pcsx2-replay.patch -text
