@@ -116,6 +116,19 @@ class Pine:
             raise PineError(f"unknown PINE result code 0x{rest[0]:02X}")
         return rest[1:]
 
+    def relay(self, body):
+        """Send one packet body as-is and return the whole reply (length, code, payload)
+        without judging it: for vr/pine_relay.py, which passes other clients' requests
+        through this connection, because PCSX2's PINE serves one client at a time."""
+        if self.sock is None:
+            self.connect()
+        self.sock.sendall(struct.pack('<I', len(body) + 4) + body)
+        head = self._recv_exactly(4)
+        total = struct.unpack('<I', head)[0]
+        if total < 5:
+            raise PineError(f"nonsense reply length {total}")
+        return head + self._recv_exactly(total - 4)
+
     # ------------------------------------------------------------ single value
     def read(self, addr, size=4):
         op = _READ_OP[size]
