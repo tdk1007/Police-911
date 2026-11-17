@@ -41,6 +41,7 @@ It also starts `frame_bridge.py -v --immersive`, which logs to `vr\bridge.log`.
    - On the EE thread at each vsync, it writes head yaw, pitch and roll, the per-eye IPD offsets and the FOV into the slots.
    - The desktop window shows L | R side by side.
    - **Flat screen outside gameplay:** while vrcam's `play` counter stalls (menus, title, briefings, results), it shows the normal picture on a world-locked SteamVR overlay (4:3, 2.4 m wide, 2.5 m ahead along the recentred forward, at head height) over black eyes. The desktop window shows the normal picture. The log says `VR: gameplay, stereo` / `VR: no gameplay, flat screen`.
+   - **Live knobs (Earpiece F-009, `vr/pcsx2-knobs.patch` on top):** PINE opcodes 0x30-0x32 set the world scale (`UnitsPerMetre`) and the flat screen's width (`FlatWidth`) while the game runs, through the bridge's relay. They start from the ini values and take effect the next vsync; the log says `VR: knob 5 = 3.25`. `py vrr_knobs_selftest.py` tests them without PCSX2.
 5. **`frame_bridge.py --immersive`:**
    - Lean, duck, fire, voice and the grip-hold recenter work as in Stage 1. The recenter also re-zeroes the fork's head yaw.
    - The green ring is projected through the head-rotated view. The shot goes through `vrshot`.

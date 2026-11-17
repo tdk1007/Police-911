@@ -1,0 +1,366 @@
+Earpiece F-009: live VR knobs (overlay width, world scale) over PINE opcodes 0x30-0x32.
+Applies on top of pcsx2-vr.patch (made against the pcsx2-vr tree as of 2026-11-03, which is
+stock v2.6.3 + pcsx2-vr.patch). Compiled (PINE.cpp, VRSession.cpp) against that tree with MSVC;
+not yet built into an executable or run in the headset: see earpiece RIG_CHECKLIST "F-009".
+
+  cd pcsx2-vr; git apply ..r\pcsx2-knobs.patch     then rebuild as usual
+  py vrr_knobs_selftest.py                         tests VRKnobs.h without PCSX2
+
+What it adds (opcodes and ids from Earpiece decision 0005; the rig side is
+earpiece-rig/src/earpiece_rig/pine.py and pcsx2_adapter.py):
+- MsgVRKnobSet 0x30 (u8 id, f32 value -> nothing, clamped), MsgVRKnobGet 0x31 (u8 id -> f32),
+  MsgVRKnobList 0x32 (-> u32 n, n x {u8 id, f32 lo, f32 hi, f32 value}). Unknown id or a
+  non-finite value: IPC_FAIL. No VM needed (host memory).
+- Knob 2 units_per_m (10..1000): OnEEVsync uses it for the eye offsets every vsync.
+- Knob 5 flat_width_m (0.5..10): the flat-screen overlay is resized the next vsync it shows.
+- Both seeded from [VR] UnitsPerMetre / FlatWidth; the ini is never written by the fork.
+
+diff --git a/pcsx2/GS/VR/VRKnobs.h b/pcsx2/GS/VR/VRKnobs.h
+new file mode 100644
+index 0000000..54dc230
+--- /dev/null
++++ b/pcsx2/GS/VR/VRKnobs.h
+@@ -0,0 +1,174 @@
++// SPDX-FileCopyrightText: 2026 Police 911 VR fork
++// SPDX-License-Identifier: GPL-3.0+
++
++// Live VR knobs for Police 24/7 VR (pcsx2-vr fork; Earpiece decision 0005, ticket F-009).
++//
++// Three PINE opcodes, handled in PINE.cpp next to the stock ones (0x30+ is unused there):
++//
++//   MsgVRKnobSet  0x30  u8 knob, f32 value -> nothing    (clamped into the knob's range)
++//   MsgVRKnobGet  0x31  u8 knob            -> f32 value  (the value in force)
++//   MsgVRKnobList 0x32                     -> u32 count, then count x {u8 id, f32 lo, f32 hi, f32 value}
++//
++// All little endian. An unknown knob id, or a Set whose value is NaN or infinite, answers
++// IPC_FAIL like any malformed PINE command; an out-of-range value is clamped, never refused.
++// A stock PCSX2 answers IPC_FAIL to all three (its `default:` case), which is how a client
++// tells an unpatched build apart.
++//
++// Values live in host memory (atomics), not game RAM, so they survive savestate loads, resets
++// and scene changes, and need no VM. Set runs on the PINE socket thread: a store, nothing else.
++// The EE thread (OnEEVsync) and the GS thread (the flat-screen overlay) read them every vsync,
++// so a change shows one vsync later. They are seeded from [VR] in PCSX2.ini at first use; the
++// ini is never written here ("keep that" is a commit to the ini by an Earpiece worker).
++//
++// Knob ids are decision 0005's; this build serves 2 and 5 (world scale and overlay width). A
++// client treats any id missing from List as restart-only.
++//
++// Self-contained (standard library only) so vr/vr_knobs_selftest.cpp in the Police-911 repo can
++// compile and test it without the rest of PCSX2.
++
++#pragma once
++
++#include <atomic>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace VRKnobs
++{
++	enum Op : std::uint8_t
++	{
++		OpSet = 0x30,
++		OpGet = 0x31,
++		OpList = 0x32,
++	};
++
++	enum Id : std::uint8_t
++	{
++		UnitsPerMetre = 2, // game units per metre: more = eyes wider apart in the game = a smaller world
++		FlatWidth = 5,     // the flat screen's width, metres (SetOverlayWidthInMeters)
++	};
++
++	struct Spec
++	{
++		std::uint8_t id;
++		float lo, hi, fallback;
++	};
++
++	// Ranges match the Earpiece adapter's table (earpiece_rig/pcsx2_adapter.py FORK_KNOBS).
++	inline constexpr Spec kSpecs[] = {
++		{UnitsPerMetre, 10.0f, 1000.0f, 100.0f},
++		{FlatWidth, 0.5f, 10.0f, 2.4f},
++	};
++	inline constexpr std::size_t kCount = sizeof(kSpecs) / sizeof(kSpecs[0]);
++	inline constexpr std::size_t kEntryBytes = 1 + 3 * 4;
++
++	inline int Index(std::uint8_t id)
++	{
++		for (std::size_t i = 0; i < kCount; i++)
++		{
++			if (kSpecs[i].id == id)
++				return static_cast<int>(i);
++		}
++		return -1;
++	}
++
++	inline float Clamp(int i, float v)
++	{
++		const Spec& s = kSpecs[i];
++		return v < s.lo ? s.lo : v > s.hi ? s.hi : v;
++	}
++
++	class Table
++	{
++	public:
++		Table()
++		{
++			for (std::size_t i = 0; i < kCount; i++)
++				m_v[i].store(kSpecs[i].fallback, std::memory_order_relaxed);
++		}
++
++		// The value from PCSX2.ini; a bad one (NaN, out of range) is clamped or ignored.
++		void Seed(std::uint8_t id, float v) { Set(id, v); }
++
++		// False for an unknown id or a value that isn't finite; otherwise clamps and stores.
++		bool Set(std::uint8_t id, float v)
++		{
++			const int i = Index(id);
++			if (i < 0 || !std::isfinite(v))
++				return false;
++			m_v[i].store(Clamp(i, v), std::memory_order_relaxed);
++			return true;
++		}
++
++		bool Get(std::uint8_t id, float* out) const
++		{
++			const int i = Index(id);
++			if (i < 0)
++				return false;
++			*out = m_v[i].load(std::memory_order_relaxed);
++			return true;
++		}
++
++		float Value(Id id) const
++		{
++			float v = 0.0f;
++			Get(id, &v);
++			return v;
++		}
++
++	private:
++		std::atomic<float> m_v[kCount];
++	};
++
++	// Bytes of arguments after the opcode, and bytes of reply payload.
++	inline constexpr std::uint32_t ArgBytes(std::uint8_t op)
++	{
++		return op == OpSet ? 5 : op == OpGet ? 1 : 0;
++	}
++	inline constexpr std::uint32_t ReplyBytes(std::uint8_t op)
++	{
++		return op == OpSet ? 0 : op == OpGet ? 4 : static_cast<std::uint32_t>(4 + kCount * kEntryBytes);
++	}
++
++	// One command. `args` holds ArgBytes(op) bytes and `out` has room for ReplyBytes(op) (the
++	// caller has bounds-checked both). False: answer IPC_FAIL.
++	inline bool Run(Table& t, std::uint8_t op, const std::uint8_t* args, std::uint8_t* out)
++	{
++		switch (op)
++		{
++			case OpSet:
++			{
++				float v;
++				std::memcpy(&v, args + 1, 4);
++				return t.Set(args[0], v);
++			}
++			case OpGet:
++			{
++				float v;
++				if (!t.Get(args[0], &v))
++					return false;
++				std::memcpy(out, &v, 4);
++				return true;
++			}
++			case OpList:
++			{
++				const std::uint32_t n = static_cast<std::uint32_t>(kCount);
++				std::memcpy(out, &n, 4);
++				out += 4;
++				for (const Spec& s : kSpecs)
++				{
++					const float v = t.Value(static_cast<Id>(s.id));
++					out[0] = s.id;
++					std::memcpy(out + 1, &s.lo, 4);
++					std::memcpy(out + 5, &s.hi, 4);
++					std::memcpy(out + 9, &v, 4);
++					out += kEntryBytes;
++				}
++				return true;
++			}
++			default:
++				return false;
++		}
++	}
++} // namespace VRKnobs
+diff --git a/pcsx2/GS/VR/VRSession.cpp b/pcsx2/GS/VR/VRSession.cpp
+index a2b0bc1..43c5f54 100644
+--- a/pcsx2/GS/VR/VRSession.cpp
++++ b/pcsx2/GS/VR/VRSession.cpp
+@@ -98,6 +98,16 @@ namespace
+ 		return c;
+ 	}
+ 
++	// The live knobs start at the ini's values; PINE (VRKnobs.h) changes them from then on.
++	struct SeededKnobs : VRKnobs::Table
++	{
++		SeededKnobs()
++		{
++			Seed(VRKnobs::UnitsPerMetre, Cfg().units_per_m);
++			Seed(VRKnobs::FlatWidth, Cfg().flat_width_m);
++		}
++	};
++
+ 	// ---- runtime-loaded openvr_api.dll ----
+ 	using PFN_Init = uint32_t (*)(vr::EVRInitError*, vr::EVRApplicationType, const char*);
+ 	using PFN_Shutdown = void (*)();
+@@ -128,6 +138,7 @@ namespace
+ 		GSTexture* black = nullptr;    // submitted to both eyes behind the overlay
+ 		bool flat_shown = false;
+ 		u32 flat_placed = 0;           // the `recentres` value the overlay was placed at, 0 = not placed
++		float flat_width = 0;          // the width last given to SetOverlayWidthInMeters
+ 
+ 		// eye geometry, fixed per session
+ 		float eye_x[2] = {-0.032f, 0.032f}; // metres, head frame
+@@ -352,7 +363,8 @@ namespace
+ 				return;
+ 			s.flat_placed = 1;
+ 			const vr::HmdMatrix34_t m = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, -Cfg().flat_dist_m}}};
+-			Check(s.overlay->SetOverlayWidthInMeters(s.flat, Cfg().flat_width_m), "SetOverlayWidthInMeters");
++			s.flat_width = VRSession::Knobs().Value(VRKnobs::FlatWidth);
++			Check(s.overlay->SetOverlayWidthInMeters(s.flat, s.flat_width), "SetOverlayWidthInMeters");
+ 			Check(s.overlay->SetOverlayTransformTrackedDeviceRelative(s.flat, vr::k_unTrackedDeviceIndex_Hmd, &m),
+ 				"SetOverlayTransformTrackedDeviceRelative");
+ 			return;
+@@ -378,10 +390,22 @@ namespace
+ 			{0, 1, 0, p.head.m[1][3]},
+ 			{-sn, 0, c, p.head.m[2][3] - c * d},
+ 		}};
+-		Check(s.overlay->SetOverlayWidthInMeters(s.flat, Cfg().flat_width_m), "SetOverlayWidthInMeters");
++		s.flat_width = VRSession::Knobs().Value(VRKnobs::FlatWidth);
++		Check(s.overlay->SetOverlayWidthInMeters(s.flat, s.flat_width), "SetOverlayWidthInMeters");
+ 		Check(s.overlay->SetOverlayTransformAbsolute(s.flat, vr::TrackingUniverseSeated, &m), "SetOverlayTransformAbsolute");
+ 	}
+ 
++	// "Overlay bigger": a live width change resizes the placed screen in place (same centre),
++	// the next vsync the flat screen is shown. Placement itself only changes on a recentre.
++	void ResizeFlat()
++	{
++		const float w = VRSession::Knobs().Value(VRKnobs::FlatWidth);
++		if (!s.flat_placed || w == s.flat_width)
++			return;
++		s.flat_width = w;
++		Check(s.overlay->SetOverlayWidthInMeters(s.flat, w), "SetOverlayWidthInMeters");
++	}
++
+ 	void SubmitEyes(GSTexture* const tex[2], const vr::VRTextureBounds_t b[2], const Pose& rendered)
+ 	{
+ 		for (int eye = 0; eye < 2; eye++)
+@@ -552,6 +576,7 @@ bool VRSession::PresentFlat(GSTexture* frame, const float uv[4])
+ 	dev->StretchRect(frame, src, s.flat_tex, GSVector4(0, 0, w, h), true, true, true, false);
+ 
+ 	PlaceFlat();
++	ResizeFlat();
+ 	vr::Texture_t t = {static_cast<ID3D11Texture2D*>(*static_cast<GSTexture11*>(s.flat_tex)), vr::TextureType_DirectX,
+ 		vr::ColorSpace_Gamma};
+ 	Check(s.overlay->SetOverlayTexture(s.flat, &t), "SetOverlayTexture");
+@@ -564,6 +589,12 @@ bool VRSession::PresentFlat(GSTexture* frame, const float uv[4])
+ 	return true;
+ }
+ 
++VRKnobs::Table& VRSession::Knobs()
++{
++	static SeededKnobs t; // thread-safe first use: PINE, EE or GS thread, whichever comes first
++	return t;
++}
++
+ u32 VRSession::GSPoseTag()
+ {
+ 	return s.gs_tag;
+@@ -641,8 +672,11 @@ void VRSession::OnEEVsync()
+ 	Poke<double>(SLOTS + S_VSCALE, STOCK_VSCALE * Cfg().tan_v / s.tan_v);
+ 	if (Peek<u32>(VR90_SITE) == VR90_JAL)
+ 	{
+-		Poke<float>(VR90 + S_EYE_L, -s.eye_x[0] * Cfg().units_per_m);
+-		Poke<float>(VR90 + S_EYE_R, -s.eye_x[1] * Cfg().units_per_m);
++		// World scale: a live knob (VRKnobs.h), read every vsync, so "world smaller" lands
++		// on the next frame.
++		const float units_per_m = VRSession::Knobs().Value(VRKnobs::UnitsPerMetre);
++		Poke<float>(VR90 + S_EYE_L, -s.eye_x[0] * units_per_m);
++		Poke<float>(VR90 + S_EYE_R, -s.eye_x[1] * units_per_m);
+ 	}
+ 	p.seq = ++s.vsync;
+ 	Poke<u32>(SLOTS + S_POSE_SEQ, p.seq);
+diff --git a/pcsx2/GS/VR/VRSession.h b/pcsx2/GS/VR/VRSession.h
+index bcced26..f70d1fa 100644
+--- a/pcsx2/GS/VR/VRSession.h
++++ b/pcsx2/GS/VR/VRSession.h
+@@ -20,6 +20,7 @@
+ #pragma once
+ 
+ #include "common/Pcsx2Defs.h"
++#include "GS/VR/VRKnobs.h"
+ 
+ class GSTexture;
+ 
+@@ -53,4 +54,8 @@ namespace VRSession
+ 	void OnDeviceClosing();
+ 
+ 	void Shutdown();
++
++	// Any thread: the live knobs (VRKnobs.h), seeded from [VR] at first use. PINE.cpp sets
++	// them; OnEEVsync (world scale) and PresentFlat (overlay width) read them every vsync.
++	VRKnobs::Table& Knobs();
+ } // namespace VRSession
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+index 333d48f..d89d620 100644
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -10,6 +10,7 @@
+ #include "PINE.h"
+ #include "VMManager.h"
+ #include "vtlb.h"
++#include "GS/VR/VRSession.h"
+ #include "common/Error.h"
+ #include "common/Threading.h"
+ 
+@@ -160,6 +161,9 @@ namespace PINEServer
+ 		MsgUUID = 0xD, /**< Returns the game UUID. */
+ 		MsgGameVersion = 0xE, /**< Returns the game verion. */
+ 		MsgStatus = 0xF, /**< Returns the emulator status. */
++		MsgVRKnobSet = 0x30, /**< VR fork: set a live knob (GS/VR/VRKnobs.h). */
++		MsgVRKnobGet = 0x31, /**< VR fork: the value of a live knob. */
++		MsgVRKnobList = 0x32, /**< VR fork: every live knob, its range and value. */
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -769,6 +773,27 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				ret_cnt += 4;
+ 				break;
+ 			}
++			case MsgVRKnobSet:
++			case MsgVRKnobGet:
++			case MsgVRKnobList:
++			{
++				// VR fork: live knobs. They live in host memory, so no VM is needed, and Set is an
++				// atomic store, safe from this thread (no RunOnCPUThread, unlike code writes).
++				static_assert(static_cast<int>(MsgVRKnobSet) == VRKnobs::OpSet && static_cast<int>(MsgVRKnobGet) == VRKnobs::OpGet &&
++							  static_cast<int>(MsgVRKnobList) == VRKnobs::OpList);
++				const u8 op = buf[buf_cnt - 1];
++				const u32 args = VRKnobs::ArgBytes(op);
++				const u32 reply = VRKnobs::ReplyBytes(op);
++				if (!SafetyChecks(buf_cnt, static_cast<int>(args), ret_cnt, static_cast<int>(reply), buf_size)) [[unlikely]]
++					goto error;
++				if (!VRKnobs::Run(VRSession::Knobs(), op, &buf[buf_cnt], &ret_buffer[ret_cnt]))
++					goto error;
++				if (op == MsgVRKnobSet)
++					Console.WriteLn("VR: knob %u = %.4g", buf[buf_cnt], VRSession::Knobs().Value(static_cast<VRKnobs::Id>(buf[buf_cnt])));
++				buf_cnt += args;
++				ret_cnt += reply;
++				break;
++			}
+ 			default:
+ 			{
+ 			error:
